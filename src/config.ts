@@ -7,7 +7,7 @@ export const config = {
   model: process.env.MODEL || "deepseek/deepseek-v4.1-flash",
   systemPrompt:
     process.env.SYSTEM_PROMPT ||
-    "You are a coding agent. Your job is to code. Always code.\nUse the bash tool to inspect files.\nAnswer back to the user once exploration is done.",
+    "You are a coding agent. Your job is to code. Always code.\nUse the bash tool and read_file to inspect files.\nAnswer back to the user once exploration is done.",
   provider: {
     only: ["together"],
     allowFallbacks: false

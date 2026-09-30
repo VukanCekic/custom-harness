@@ -9,6 +9,7 @@ A clean, extensible Node.js + TypeScript coding agent built with `@openrouter/sd
 - [`src/tools/`](file:///d:/code/coding-harness/src/tools/): Modular tool architecture.
   - [`src/tools/types.ts`](file:///d:/code/coding-harness/src/tools/types.ts): Standard `Tool` interface.
   - [`src/tools/bash.ts`](file:///d:/code/coding-harness/src/tools/bash.ts): Shell execution tool (`bash`), capturing stdout + stderr.
+  - [`src/tools/readFile.ts`](file:///d:/code/coding-harness/src/tools/readFile.ts): Direct file reading tool (`read_file`).
   - [`src/tools/index.ts`](file:///d:/code/coding-harness/src/tools/index.ts): Central tool registry and dispatcher.
 - [`src/llm.ts`](file:///d:/code/coding-harness/src/llm.ts): Streaming `callLLM(messages, tools, onChunk)` measuring TTFT, pure generation speed, and tool-call delta accumulation.
 - [`src/index.ts`](file:///d:/code/coding-harness/src/index.ts): Autonomous multi-turn agent loop executing tools, reporting metrics, and saving complete transcripts.
