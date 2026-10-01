@@ -21,5 +21,10 @@ export const config = {
   provider: {
     only: ["together"],
     allowFallbacks: false
-  }
+  },
+  contextWindow: Number(process.env.CONTEXT_WINDOW) || 64_000,
+  compactAt: Number(process.env.COMPACT_AT) || 0.85,
+  compactTo: Number(process.env.COMPACT_TO) || 0.35,
+  toolCap: Number(process.env.TOOL_CAP) || 10_000,
+  toolStub: Number(process.env.TOOL_STUB) || 300
 };

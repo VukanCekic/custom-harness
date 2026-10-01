@@ -9,6 +9,7 @@ import { closeBrowser } from "./tools/browser.js";
 
 import { activeForm } from "./todos.js";
 import * as sandbox from "./sandbox.js";
+import { compact } from "./compact.js";
 
 async function loadLastSessionTranscript(): Promise<ChatMessages[] | null> {
   const testDir = path.resolve(process.cwd(), "test");
@@ -72,6 +73,11 @@ async function runSession(
       onMessage: (content) => {
         spinner.stop();
         ui.agent(content);
+        spinner = ui.working(`${activeForm()}...`);
+      },
+      onCompacted: (before, compactedMessages) => {
+        spinner.stop();
+        ui.compacted(before, compactedMessages);
         spinner = ui.working(`${activeForm()}...`);
       },
       onStepEnd: (_step, usage) => {
@@ -191,8 +197,27 @@ async function main() {
           ui.note("Session reset. Conversation history cleared and browser closed.");
           continue;
         }
+        if (cmd === "/compact") {
+          const before = sessionMessages.length;
+          const compSpinner = ui.working("compacting transcript...");
+          try {
+            await compact(sessionMessages);
+            compSpinner.stop();
+            if (sessionMessages.length < before) {
+              ui.compacted(before, sessionMessages);
+            } else {
+              ui.note("Transcript is not long enough to compact.");
+            }
+          } catch (err: any) {
+            compSpinner.stop();
+            ui.note(`Compaction failed: ${err.message || String(err)}`);
+          }
+          continue;
+        }
         if (cmd === "/help") {
-          ui.note("Commands:\n    /clear - Clear session history and close browser\n    /help  - Show available commands");
+          ui.note(
+            "Commands:\n    /clear   - Clear session history and close browser\n    /compact - Compact conversation history to free up context\n    /help    - Show available commands"
+          );
           continue;
         }
       }
