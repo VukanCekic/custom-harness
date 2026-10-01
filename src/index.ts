@@ -1,20 +1,42 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { ChatMessages } from "@openrouter/sdk/models";
 import { config } from "./config.js";
 import { runAgent } from "./agent.js";
 import { saveRunResult } from "./recorder.js";
 import { ui } from "./ui.js";
+import { closeBrowser } from "./tools/browser.js";
 
-async function runSession(promptText: string): Promise<void> {
+async function loadLastSessionTranscript(): Promise<ChatMessages[] | null> {
+  const testDir = path.resolve(process.cwd(), "test");
+  try {
+    const files = await fs.readdir(testDir);
+    const jsonFiles = files.filter((f) => f.startsWith("run_") && f.endsWith(".json"));
+    if (jsonFiles.length === 0) return null;
+
+    jsonFiles.sort().reverse();
+    const latestFile = path.join(testDir, jsonFiles[0]);
+    const content = await fs.readFile(latestFile, "utf-8");
+    const record = JSON.parse(content);
+    return Array.isArray(record.transcript) ? record.transcript : null;
+  } catch {
+    return null;
+  }
+}
+
+async function runSession(
+  promptText: string,
+  sessionMessages?: ChatMessages[],
+  debug = false
+): Promise<void> {
   ui.user(promptText);
 
   let spinner = ui.working("thinking...");
 
   try {
     const result = await runAgent(promptText, {
-      maxTurns: 50,
-      onTurnStart: (turn) => {
-        spinner.stop();
-        spinner = ui.working(`thinking (turn ${turn})...`);
-      },
+      messages: sessionMessages,
+      // Runs autonomously until the agent completes all tool actions
       onToolCall: (toolName) => {
         spinner.stop();
         spinner = ui.working(`running ${toolName}...`);
@@ -24,22 +46,32 @@ async function runSession(promptText: string): Promise<void> {
         ui.tool(toolName, args, toolResult);
         spinner = ui.working("thinking...");
       },
-      onTurnEnd: (_turn, usage) => {
+      onAssistantMessage: (assistantMsg) => {
+        if (debug) {
+          spinner.stop();
+          ui.debug(assistantMsg);
+          spinner = ui.working("thinking...");
+        }
+      },
+      onMessage: (content) => {
+        spinner.stop();
+        ui.agent(content);
+        spinner = ui.working("thinking...");
+      },
+      onStepEnd: (_step, usage) => {
         if (usage) {
+          spinner.stop();
           ui.usage({
             prompt_tokens: usage.prompt_tokens,
             completion_tokens: usage.completion_tokens,
             cached_tokens: usage.cached_tokens
           });
+          spinner = ui.working("thinking...");
         }
       }
     });
 
     spinner.stop();
-
-    if (result.finalResponse) {
-      ui.agent(result.finalResponse);
-    }
 
     const e2eSpeed =
       result.lastMetrics?.e2e_tokens_per_second != null
@@ -70,7 +102,7 @@ async function runSession(promptText: string): Promise<void> {
       const savedPath = await saveRunResult({
         prompt: promptText,
         model: config.model,
-        turns: result.turns,
+        steps: result.steps,
         final_response: result.finalResponse,
         usage: result.lastUsage
           ? {
@@ -99,25 +131,65 @@ async function main() {
 
   ui.banner(process.env.SANDBOX || "local", config.model);
 
-  // Support command-line argument prompt or interactive prompt loop
-  const cliPrompt = process.argv.slice(2).join(" ").trim();
+  const args = process.argv.slice(2);
+  const isResume = args.includes("--resume");
+  const isDebug = args.includes("--debug");
+  const promptArgs = args.filter((a) => !a.startsWith("--"));
+  const cliPrompt = promptArgs.join(" ").trim();
 
-  if (cliPrompt) {
-    await runSession(cliPrompt);
-    return;
+  let sessionMessages: ChatMessages[] = [
+    { role: "system", content: config.systemPrompt }
+  ];
+
+  if (isResume) {
+    const resumedTranscript = await loadLastSessionTranscript();
+    if (resumedTranscript && resumedTranscript.length > 0) {
+      sessionMessages = resumedTranscript;
+      ui.resumed(sessionMessages);
+      ui.replay(sessionMessages);
+    } else {
+      ui.note("No past session found in test/ to resume.");
+    }
   }
 
-  // Interactive mode
-  while (true) {
-    const userInput = await ui.ask();
-    if (!userInput) {
-      break;
+  try {
+    if (cliPrompt) {
+      await runSession(cliPrompt, sessionMessages, isDebug);
+      return;
     }
-    await runSession(userInput);
+
+    // Interactive mode: maintains conversation history across prompts
+    while (true) {
+      const userInput = await ui.ask();
+      if (!userInput) {
+        break;
+      }
+
+      if (userInput.startsWith("/")) {
+        const cmd = userInput.trim().toLowerCase();
+        if (cmd === "/clear" || cmd === "/new" || cmd === "/reset") {
+          await closeBrowser();
+          sessionMessages = [
+            { role: "system", content: config.systemPrompt }
+          ];
+          ui.note("Session reset. Conversation history cleared and browser closed.");
+          continue;
+        }
+        if (cmd === "/help") {
+          ui.note("Commands:\n    /clear - Clear session history and close browser\n    /help  - Show available commands");
+          continue;
+        }
+      }
+
+      await runSession(userInput, sessionMessages, isDebug);
+    }
+  } finally {
+    await closeBrowser();
   }
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
+  await closeBrowser();
   console.error("\nFatal error:", err);
   process.exit(1);
 });

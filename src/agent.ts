@@ -1,57 +1,65 @@
 import type { ChatMessages } from "@openrouter/sdk/models";
 import { config } from "./config.js";
-import { callLLM, type DetailedUsage, type TimingMetrics } from "./llm.js";
+import {
+  callLLM,
+  type AssistantMessageResult,
+  type DetailedUsage,
+  type TimingMetrics
+} from "./llm.js";
 import { executeTool, TOOL_SCHEMAS } from "./tools/index.js";
 
 export interface AgentOptions {
-  maxTurns?: number;
-  onTurnStart?: (turn: number) => void;
-  onTurnEnd?: (turn: number, usage: DetailedUsage | null) => void;
+  messages?: ChatMessages[];
+  onStepStart?: (step: number) => void;
+  onStepEnd?: (step: number, usage: DetailedUsage | null) => void;
   onToolCall?: (toolName: string, args: Record<string, any>) => void;
   onToolResult?: (toolName: string, result: string) => void;
   onToolExecution?: (toolName: string, args: Record<string, any>, result: string) => void;
+  onMessage?: (content: string) => void;
+  onAssistantMessage?: (message: AssistantMessageResult) => void;
   onChunk?: (chunk: string) => void;
 }
 
 export interface AgentResult {
   finalResponse: string;
   messages: ChatMessages[];
-  turns: number;
+  steps: number;
   totalCost: number;
   lastUsage: DetailedUsage | null;
   lastMetrics: TimingMetrics | null;
 }
 
 /**
- * Runs the agentic loop.
- * Continues sending messages and executing requested tools in a while loop
+ * Runs the autonomous agent loop.
+ * Continues calling the LLM and executing requested tools in a loop
  * until the model finishes without requesting any more tool calls.
  */
 export async function runAgent(
   userInput: string,
   options: AgentOptions = {}
 ): Promise<AgentResult> {
-  const maxTurns = options.maxTurns ?? 15;
-
-  const messages: ChatMessages[] = [
-    { role: "system", content: config.systemPrompt },
-    { role: "user", content: userInput }
+  // If an existing conversation history is provided, append user prompt to it;
+  // otherwise, initialize a fresh transcript with system prompt.
+  const messages: ChatMessages[] = options.messages ?? [
+    { role: "system", content: config.systemPrompt }
   ];
 
-  let turn = 0;
+  const lastMsg = messages[messages.length - 1];
+  if (userInput && (lastMsg?.role !== "user" || lastMsg?.content !== userInput)) {
+    messages.push({ role: "user", content: userInput });
+  }
+
+  let step = 0;
   let totalCost = 0;
   let lastUsage: DetailedUsage | null = null;
   let lastMetrics: TimingMetrics | null = null;
   let finalResponse = "";
 
   while (true) {
-    turn++;
-    if (turn > maxTurns) {
-      break;
-    }
+    step++;
 
-    if (options.onTurnStart) {
-      options.onTurnStart(turn);
+    if (options.onStepStart) {
+      options.onStepStart(step);
     }
 
     // Call the LLM with current conversation history and available tools
@@ -74,9 +82,22 @@ export async function runAgent(
       toolCalls: message.toolCalls
     });
 
+    if (options.onAssistantMessage) {
+      options.onAssistantMessage(message);
+    }
+
+    if (message.content) {
+      finalResponse = message.content;
+      if (options.onMessage) {
+        options.onMessage(message.content);
+      }
+    }
+
     // If no tool calls were requested, the agent is done
     if (!message.toolCalls || message.toolCalls.length === 0) {
-      finalResponse = message.content || "";
+      if (options.onStepEnd) {
+        options.onStepEnd(step, usage);
+      }
       break;
     }
 
@@ -118,15 +139,15 @@ export async function runAgent(
       });
     }
 
-    if (options.onTurnEnd) {
-      options.onTurnEnd(turn, usage);
+    if (options.onStepEnd) {
+      options.onStepEnd(step, usage);
     }
   }
 
   return {
     finalResponse,
     messages,
-    turns: turn,
+    steps: step,
     totalCost,
     lastUsage,
     lastMetrics

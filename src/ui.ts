@@ -258,9 +258,8 @@ export class UI {
   }
 
   resumed(messages: Array<{ role: string }>, label = "resumed"): void {
-    const turns = messages.filter((m) => m.role === "user").length;
     console.log(
-      `  ${cMuted(`${label} · ${messages.length} messages · ${turns} turns`)}`
+      `  ${cMuted(`${label} · ${messages.length} messages`)}`
     );
   }
 

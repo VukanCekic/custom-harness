@@ -8,7 +8,7 @@ export interface RunRecord {
   timestamp: string;
   prompt: string;
   model: string;
-  turns: number;
+  steps: number;
   final_response: string | null;
   usage: DetailedUsage | null;
   metrics: TimingMetrics | null;

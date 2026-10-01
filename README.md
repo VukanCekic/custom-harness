@@ -10,9 +10,10 @@ A clean, extensible Node.js + TypeScript coding agent built with `@openrouter/sd
   - [`src/tools/types.ts`](file:///d:/code/coding-harness/src/tools/types.ts): Standard `Tool` interface.
   - [`src/tools/bash.ts`](file:///d:/code/coding-harness/src/tools/bash.ts): Shell execution tool (`bash`), capturing stdout + stderr.
   - [`src/tools/readFile.ts`](file:///d:/code/coding-harness/src/tools/readFile.ts): Direct file reading tool (`read_file`).
+  - [`src/tools/browser.ts`](file:///d:/code/coding-harness/src/tools/browser.ts): Direct browser automation via `browserclaw` (visible window by default, snapshot + ref targeting, zero npx overhead).
   - [`src/tools/index.ts`](file:///d:/code/coding-harness/src/tools/index.ts): Central tool registry and dispatcher.
 - [`src/llm.ts`](file:///d:/code/coding-harness/src/llm.ts): Streaming `callLLM(messages, tools, onChunk)` measuring TTFT, pure generation speed, and tool-call delta accumulation.
-- [`src/index.ts`](file:///d:/code/coding-harness/src/index.ts): Autonomous multi-turn agent loop executing tools, reporting metrics, and saving complete transcripts.
+- [`src/index.ts`](file:///d:/code/coding-harness/src/index.ts): Autonomous agent loop executing tools until task completion, reporting metrics, session resumption, and saving complete transcripts.
 
 ## Session Recording (`test/`)
 
@@ -24,11 +25,11 @@ test/
 Each file captures:
 - `id` & `timestamp`
 - `prompt` & `model`
-- `turns` taken
+- `steps` (steps taken)
 - `final_response`
 - `usage` (prompt tokens, completion tokens, reasoning tokens, cached tokens, and cost)
 - `metrics` (pure generation speed, e2e speed, TTFT, generation time)
-- `transcript` (complete step-by-step history of assistant turns, tool calls, and outputs)
+- `transcript` (complete step-by-step history of assistant actions, tool calls, and outputs)
 
 ## Running the Agent
 
@@ -40,11 +41,22 @@ Each file captures:
 2. **Interactive Prompt**:
    ```bash
    npm run dev
-   # Prompts: Enter your prompt>
+   # Prompts: >
+   # Commands: /clear (reset session), /help
    ```
 
-3. **Direct CLI Argument**:
+3. **Resume Last Session**:
+   ```bash
+   npm run dev -- --resume
+   ```
+
+4. **Direct CLI Argument**:
    ```bash
    npm run dev -- "Check what git branch I am currently on."
    npm run dev -- "List all TypeScript files in the src directory."
+   ```
+
+5. **Debug Mode**:
+   ```bash
+   npm run dev -- --debug "Inspect project layout"
    ```

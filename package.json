@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "@openrouter/sdk": "^1.4.10",
-    "agent-browser": "^0.38.1",
+    "browserclaw": "^0.20.1",
     "dotenv": "^18.0.4",
     "picocolors": "^1.1.1",
     "playwright": "^1.63.0",

@@ -1,6 +1,6 @@
 ---
 name: wordle-solver
-description: Strategy, workflow, and browser automation instructions for solving Wordle puzzles autonomously using agent-browser refs.
+description: Strategy, workflow, and browser automation instructions for solving Wordle puzzles autonomously using browserclaw refs.
 ---
 
 # Wordle Solver Workflow
