@@ -4,6 +4,7 @@ import { bashTool } from "./bash.js";
 import { readFileTool } from "./readFile.js";
 import { writeFileTool } from "./writeFile.js";
 import { stringReplaceTool } from "./stringReplace.js";
+import { writeTodosTool } from "./writeTodos.js";
 import { readSkillTool } from "./readSkill.js";
 import { browserTool } from "./browser.js";
 
@@ -16,6 +17,7 @@ export const registeredTools: Tool[] = [
   readFileTool,
   writeFileTool,
   stringReplaceTool,
+  writeTodosTool,
   readSkillTool,
   browserTool
 ];
@@ -45,5 +47,6 @@ export * from "./bash.js";
 export * from "./readFile.js";
 export * from "./writeFile.js";
 export * from "./stringReplace.js";
+export * from "./writeTodos.js";
 export * from "./readSkill.js";
 export * from "./browser.js";

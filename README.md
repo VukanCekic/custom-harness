@@ -12,9 +12,13 @@ A clean, extensible Node.js + TypeScript coding agent built with `@openrouter/sd
   - [`src/tools/readFile.ts`](file:///d:/code/coding-harness/src/tools/readFile.ts): Direct file reading tool (`read_file`).
   - [`src/tools/writeFile.ts`](file:///d:/code/coding-harness/src/tools/writeFile.ts): Direct file creation and overwriting tool (`write_file`).
   - [`src/tools/stringReplace.ts`](file:///d:/code/coding-harness/src/tools/stringReplace.ts): Targeted file modification tool (`string_replace` / `str_replace`).
+  - [`src/tools/writeTodos.ts`](file:///d:/code/coding-harness/src/tools/writeTodos.ts): Task planning and status management tool (`write_todos`).
   - [`src/tools/browser.ts`](file:///d:/code/coding-harness/src/tools/browser.ts): Direct browser automation via `browserclaw` (visible window by default, snapshot + ref targeting, zero npx overhead).
   - [`src/tools/index.ts`](file:///d:/code/coding-harness/src/tools/index.ts): Central tool registry and dispatcher.
-- [`src/context.ts`](file:///d:/code/coding-harness/src/context.ts): Late prompt injection module providing ephemeral environment reminders (`time`, `git branch`, git file diffs, disk staleness warnings) appended at the end of requests to keep the prefix cache 100% stable.
+- [`src/sandbox.ts`](file:///d:/code/coding-harness/src/sandbox.ts): OS-aware sandbox runner and project boundary isolation (`windows`, `seatbelt`, `bubblewrap`).
+- [`src/permissions.ts`](file:///d:/code/coding-harness/src/permissions.ts): Granular permission rules engine classifying commands into `allow` (silent execution for safe/read-only commands) or `ask` (human confirmation for deletion, modification, or risky commands).
+- [`src/todos.ts`](file:///d:/code/coding-harness/src/todos.ts): In-memory execution plan and active task tracker, providing dynamic spinner labels (`activeForm`) and prompt formatting (`<todos>`).
+- [`src/context.ts`](file:///d:/code/coding-harness/src/context.ts): Late prompt injection module providing ephemeral environment reminders (`time`, `git branch`, todos plan, git file diffs, disk staleness warnings) appended at the end of requests to keep the prefix cache 100% stable.
 - [`src/llm.ts`](file:///d:/code/coding-harness/src/llm.ts): Streaming `callLLM(messages, tools, onChunk)` measuring TTFT, pure generation speed, and tool-call delta accumulation.
 - [`src/index.ts`](file:///d:/code/coding-harness/src/index.ts): Autonomous agent loop executing tools until task completion, reporting metrics, session resumption, and saving complete transcripts.
 

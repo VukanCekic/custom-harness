@@ -7,6 +7,9 @@ import { saveRunResult } from "./recorder.js";
 import { ui } from "./ui.js";
 import { closeBrowser } from "./tools/browser.js";
 
+import { activeForm } from "./todos.js";
+import * as sandbox from "./sandbox.js";
+
 async function loadLastSessionTranscript(): Promise<ChatMessages[] | null> {
   const testDir = path.resolve(process.cwd(), "test");
   try {
@@ -31,7 +34,7 @@ async function runSession(
 ): Promise<void> {
   ui.user(promptText);
 
-  let spinner = ui.working("thinking...");
+  let spinner = ui.working(`${activeForm()}...`);
 
   try {
     const result = await runAgent(promptText, {
@@ -44,26 +47,32 @@ async function runSession(
       onToolExecution: (toolName, args, toolResult) => {
         spinner.stop();
         ui.tool(toolName, args, toolResult);
-        spinner = ui.working("thinking...");
+        spinner = ui.working(`${activeForm()}...`);
+      },
+      onApprove: async (reason) => {
+        spinner.stop();
+        const approved = await ui.approve(reason);
+        spinner = ui.working(`${activeForm()}...`);
+        return approved;
       },
       onAssistantMessage: (assistantMsg) => {
         if (debug) {
           spinner.stop();
           ui.debug(assistantMsg);
-          spinner = ui.working("thinking...");
+          spinner = ui.working(`${activeForm()}...`);
         }
       },
       onInjection: (content) => {
         if (debug || content.includes("<system-reminder>")) {
           spinner.stop();
           ui.injection(content);
-          spinner = ui.working("thinking...");
+          spinner = ui.working(`${activeForm()}...`);
         }
       },
       onMessage: (content) => {
         spinner.stop();
         ui.agent(content);
-        spinner = ui.working("thinking...");
+        spinner = ui.working(`${activeForm()}...`);
       },
       onStepEnd: (_step, usage) => {
         if (usage) {
@@ -73,7 +82,7 @@ async function runSession(
             completion_tokens: usage.completion_tokens,
             cached_tokens: usage.cached_tokens
           });
-          spinner = ui.working("thinking...");
+          spinner = ui.working(`${activeForm()}...`);
         }
       }
     });
@@ -136,7 +145,7 @@ async function main() {
     process.exit(1);
   }
 
-  ui.banner(process.env.SANDBOX || "local", config.model);
+  ui.banner(sandbox.name(), config.model);
 
   const args = process.argv.slice(2);
   const isResume = args.includes("--resume");

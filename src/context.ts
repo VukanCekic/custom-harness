@@ -122,14 +122,10 @@ export function staleNote(): string {
   );
 }
 
-let todosProvider: (() => string) | null = null;
-
-export function setTodosProvider(provider: (() => string) | null): void {
-  todosProvider = provider;
-}
+import { todosPrompt, clearTodos } from "./todos.js";
 
 export function todosNote(): string {
-  const plan = todosProvider ? todosProvider() : "";
+  const plan = todosPrompt();
   return plan ? `\n<todos>\n${plan}\n</todos>` : "";
 }
 
@@ -139,6 +135,7 @@ export function todosNote(): string {
 export function resetContextState(): void {
   lastState = gitState();
   SEEN.clear();
+  clearTodos();
 }
 
 /**

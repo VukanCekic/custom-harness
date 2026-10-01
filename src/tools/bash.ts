@@ -1,8 +1,5 @@
-import { exec } from "node:child_process";
-import { promisify } from "node:util";
 import type { Tool } from "./types.js";
-
-const execAsync = promisify(exec);
+import { run } from "../sandbox.js";
 
 export interface BashArgs {
   command: string;
@@ -32,17 +29,7 @@ export const bashTool: Tool<BashArgs, string> = {
   },
   execute: async ({ command }) => {
     try {
-      const shell =
-        process.platform === "win32"
-          ? "powershell.exe"
-          : process.env.SHELL || "/bin/bash";
-
-      const { stdout, stderr } = await execAsync(command, {
-        cwd: process.cwd(),
-        maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-        shell
-      });
-
+      const { stdout, stderr } = await run(command);
       const output = (stdout + (stderr ? `\nSTDERR:\n${stderr}` : "")).trim();
       return output || "[Command executed successfully with no output]";
     } catch (err: any) {

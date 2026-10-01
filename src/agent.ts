@@ -8,6 +8,7 @@ import {
 } from "./llm.js";
 import { executeTool, TOOL_SCHEMAS } from "./tools/index.js";
 import { reminder } from "./context.js";
+import { check } from "./permissions.js";
 
 export interface AgentOptions {
   messages?: ChatMessages[];
@@ -19,6 +20,7 @@ export interface AgentOptions {
   onMessage?: (content: string) => void;
   onAssistantMessage?: (message: AssistantMessageResult) => void;
   onInjection?: (content: string) => void;
+  onApprove?: (reason: string) => Promise<boolean>;
   onChunk?: (chunk: string) => void;
   injectReminder?: boolean;
 }
@@ -132,11 +134,32 @@ export async function runAgent(
         options.onToolCall(toolName, args);
       }
 
+      // Check permissions / sandbox policy
+      const permission = check(toolName, args);
       let result = "";
-      try {
-        result = await executeTool(toolName, args);
-      } catch (err: any) {
-        result = `Tool error: ${err.message || String(err)}`;
+
+      if (permission.action === "deny") {
+        result = `Permission denied: ${permission.reason || toolName} is blocked by security policy.`;
+      } else if (permission.action === "ask") {
+        const approved = options.onApprove
+          ? await options.onApprove(permission.reason || `Execute ${toolName}`)
+          : false;
+
+        if (!approved) {
+          result = `Permission denied by user for ${permission.reason || toolName}.`;
+        } else {
+          try {
+            result = await executeTool(toolName, args);
+          } catch (err: any) {
+            result = `Tool error: ${err.message || String(err)}`;
+          }
+        }
+      } else {
+        try {
+          result = await executeTool(toolName, args);
+        } catch (err: any) {
+          result = `Tool error: ${err.message || String(err)}`;
+        }
       }
 
       if (options.onToolResult) {
