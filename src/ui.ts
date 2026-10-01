@@ -6,7 +6,7 @@
  * Modeled after rich terminal UI with Tokyo Night palette.
  */
 
-import readline from "node:readline/promises";
+import readline from "node:readline";
 import { stdin as input, stdout as output } from "node:process";
 
 // ---------------------------------------------------------------- palette
@@ -32,7 +32,6 @@ export const MARKS: Record<string, string> = {
 
 const ANSI_RESET = "\x1b[0m";
 const ANSI_BOLD = "\x1b[1m";
-const ANSI_DIM = "\x1b[2m";
 const ANSI_ITALIC = "\x1b[3m";
 const ANSI_STRIKE = "\x1b[9m";
 
@@ -72,13 +71,72 @@ export function cStrike(text: string): string {
   return `${ANSI_STRIKE}${text}${ANSI_RESET}`;
 }
 
+// eslint-disable-next-line no-control-regex
+const SGR = /\x1b\[[0-9;]*m/g;
+
 export function stripAnsi(str: string): string {
-  // eslint-disable-next-line no-control-regex
-  return str.replace(/\x1b\[[0-9;]*m/g, "");
+  return str.replace(SGR, "");
 }
 
 export function visibleLength(str: string): number {
-  return stripAnsi(str).length;
+  return [...stripAnsi(str)].length;
+}
+
+/**
+ * Make text from a tool or the model safe to print: no escape sequences
+ * (colours, cursor moves, OSC hyperlinks and title changes, terminal queries),
+ * no control characters, and carriage-return progress bars collapsed to
+ * their final state. Tool output is untrusted; printed raw it can rewrite
+ * what the user sees on screen.
+ */
+export function sanitize(text: string): string {
+  return text
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "") // OSC
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "") // CSI
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b[@-Z\\-_]?/g, "") // other escapes
+    .split("\n")
+    .map((line) => {
+      const parts = line.split("\r");
+      return parts.length > 1 ? parts.filter(Boolean).pop() ?? "" : line;
+    })
+    .join("\n")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
+}
+
+/**
+ * Break a line that may contain SGR colour codes into pieces at most `width`
+ * visible characters wide, carrying the active colour onto each new piece.
+ */
+export function wrapAnsi(line: string, width: number): string[] {
+  if (width <= 0 || visibleLength(line) <= width) return [line];
+  const pieces: string[] = [];
+  let current = "";
+  let visible = 0;
+  let active = "";
+  // eslint-disable-next-line no-control-regex
+  for (const token of line.split(/(\x1b\[[0-9;]*m)/)) {
+    if (!token) continue;
+    if (token.startsWith("\x1b[")) {
+      current += token;
+      active = token === ANSI_RESET ? "" : active + token;
+      continue;
+    }
+    for (const char of token) {
+      if (visible === width) {
+        pieces.push(current + ANSI_RESET);
+        current = active;
+        visible = 0;
+      }
+      current += char;
+      visible++;
+    }
+  }
+  if (visible > 0 || pieces.length === 0) pieces.push(current);
+  return pieces;
 }
 
 // ---------------------------------------------------------------- markdown helper
@@ -143,8 +201,8 @@ export function renderPanel(
   options: PanelOptions = {}
 ): string {
   const termWidth = process.stdout.columns || 80;
-  const targetWidth = Math.min(termWidth - 4, options.width || 88);
   const padLeft = options.paddingLeft ?? 2;
+  const targetWidth = Math.max(20, Math.min(termWidth - padLeft - 2, options.width || 88));
   const padPrefix = " ".repeat(padLeft);
 
   const bCol = options.borderColor || cMuted;
@@ -172,7 +230,9 @@ export function renderPanel(
     lines.push(padPrefix + bCol("╭" + "─".repeat(targetWidth - 2) + "╮"));
   }
 
-  // Content body
+  const innerWidth = targetWidth - 4; // 2 for borders, 2 for inner padding
+
+  // Content body - long lines wrap instead of pushing the border off screen
   for (const rawLine of contentLines) {
     // If it's a divider rule inside the panel
     if (rawLine === "__DIVIDER__") {
@@ -182,17 +242,16 @@ export function renderPanel(
       continue;
     }
 
-    const vLen = visibleLength(rawLine);
-    const innerWidth = targetWidth - 4; // 2 for borders, 2 for inner padding
-    const paddingRight = Math.max(0, innerWidth - vLen);
-
-    lines.push(
-      padPrefix +
-        bCol("│ ") +
-        rawLine +
-        " ".repeat(paddingRight) +
-        bCol(" │")
-    );
+    for (const piece of wrapAnsi(rawLine, innerWidth)) {
+      const paddingRight = Math.max(0, innerWidth - visibleLength(piece));
+      lines.push(
+        padPrefix +
+          bCol("│ ") +
+          piece +
+          " ".repeat(paddingRight) +
+          bCol(" │")
+      );
+    }
   }
 
   // Bottom border
@@ -227,15 +286,32 @@ export function renderRule(
   );
 }
 
+const money = (value: number) => `$${value.toFixed(6)}`;
+
+export interface SpendLine {
+  calls: number;
+  cost: number;
+  promptTokens: number;
+  cachedTokens: number;
+  completionTokens: number;
+}
+
 // ---------------------------------------------------------------- UI class
 
 export class UI {
   private _totals: Record<string, number> = {};
   private _spinnerInterval: NodeJS.Timeout | null = null;
+  private _streaming = false;
+  private _lastInterrupt = 0;
+
+  /** Input history, newest first (readline's order). Owned by the caller, who may persist it. */
+  history: string[] = [];
+  /** Called when Ctrl+C is pressed inside a prompt that is part of a running turn. */
+  onInterrupt: (() => void) | null = null;
 
   // -------------------------------------------------------------- input
 
-  banner(sandboxName = "none", modelName?: string): void {
+  banner(sandboxName = "none", modelName?: string, extras: string[] = []): void {
     console.log();
     const titleText = cBold(cAccent(" custom-harness "));
     console.log(renderRule(titleText, cMuted));
@@ -243,8 +319,8 @@ export class UI {
     const metaParts = [
       `sandbox: ${sandboxName}`,
       modelName ? `model: ${modelName}` : null,
-      "cache: enabled",
-      "ctrl-c to exit"
+      ...extras,
+      "/help for commands · ctrl-d to exit"
     ].filter(Boolean);
 
     console.log(
@@ -253,42 +329,178 @@ export class UI {
     console.log();
   }
 
-  clear(): void {
-    console.clear();
-  }
-
   resumed(messages: Array<{ role: string }>, label = "resumed"): void {
     console.log(
       `  ${cMuted(`${label} · ${messages.length} messages`)}`
     );
   }
 
-  async ask(promptStr = "> "): Promise<string> {
-    const rl = readline.createInterface({ input, output });
-    try {
-      console.log();
-      const answer = await rl.question(cBold(cAccent(promptStr)));
-      return answer.trim();
-    } catch {
-      console.log();
-      return "";
-    } finally {
-      rl.close();
+  /**
+   * One readline prompt. Ctrl+C rejects the current line; Ctrl+D (end of
+   * input) resolves to null.
+   */
+  private _prompt(
+    promptStr: string,
+    options: {
+      history?: boolean;
+      multiline?: boolean;
+      /** What Ctrl+C does: clear the typed text, stay at the prompt, or leave it (null). */
+      onSigint?: (pending: boolean) => "clear" | "stay" | "exit";
     }
+  ): Promise<string | null> {
+    if (!input.isTTY) return this._pipedPrompt(promptStr, Boolean(options.multiline));
+    return new Promise((resolve) => {
+      const rl = readline.createInterface({
+        input,
+        output,
+        terminal: Boolean(input.isTTY && output.isTTY),
+        history: options.history ? [...this.history] : [],
+        historySize: options.history ? 1000 : 0,
+        removeHistoryDuplicates: true
+      });
+      const lines: string[] = [];
+      let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      const finish = (value: string | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (options.history && value && value.trim()) {
+          this.history = [value, ...this.history.filter((h) => h !== value)].slice(0, 1000);
+        }
+        rl.close();
+        resolve(value);
+      };
+
+      rl.setPrompt(promptStr);
+      rl.prompt();
+
+      rl.on("line", (line) => {
+        if (options.multiline && line.endsWith("\\")) {
+          lines.push(line.slice(0, -1));
+          rl.setPrompt(cMuted("  … "));
+          rl.prompt();
+          return;
+        }
+        lines.push(line);
+        if (!options.multiline) return finish(lines.join("\n"));
+        // A paste arrives as several lines at once: gather them for a moment
+        // instead of sending the first and losing the rest.
+        clearTimeout(timer);
+        timer = setTimeout(() => finish(lines.join("\n")), 20);
+      });
+      rl.on("SIGINT", () => {
+        const verdict = options.onSigint?.(Boolean(rl.line) || lines.length > 0) ?? "exit";
+        if (verdict === "exit") return finish(null);
+        if (verdict === "clear") {
+          lines.length = 0;
+          rl.write(null, { ctrl: true, name: "e" });
+          rl.write(null, { ctrl: true, name: "u" });
+        }
+        output.write("\n");
+        rl.setPrompt(promptStr);
+        rl.prompt();
+      });
+      rl.on("close", () => finish(lines.length > 0 ? lines.join("\n") : null));
+    });
+  }
+
+  // Piped input: one reader for the whole process. A readline per prompt
+  // buffers everything already piped in and loses it on close, so a script
+  // of several commands ended after the first one.
+  private _piped: { lines: string[]; waiting: Array<(line: string | null) => void>; closed: boolean } | null = null;
+
+  private _nextPipedLine(): Promise<string | null> {
+    if (!this._piped) {
+      const state = { lines: [] as string[], waiting: [] as Array<(line: string | null) => void>, closed: false };
+      const reader = readline.createInterface({ input, terminal: false });
+      reader.on("line", (line) => {
+        const waiter = state.waiting.shift();
+        if (waiter) waiter(line);
+        else state.lines.push(line);
+      });
+      reader.on("close", () => {
+        state.closed = true;
+        for (const waiter of state.waiting.splice(0)) waiter(null);
+      });
+      this._piped = state;
+    }
+    const state = this._piped;
+    if (state.lines.length > 0) return Promise.resolve(state.lines.shift()!);
+    if (state.closed) return Promise.resolve(null);
+    return new Promise((resolve) => state.waiting.push(resolve));
+  }
+
+  private async _pipedPrompt(promptStr: string, multiline: boolean): Promise<string | null> {
+    output.write(promptStr);
+    const lines: string[] = [];
+    while (true) {
+      const line = await this._nextPipedLine();
+      if (line == null) {
+        output.write("\n");
+        return lines.length > 0 ? lines.join("\n") : null;
+      }
+      output.write(`${line}\n`);
+      if (multiline && line.endsWith("\\")) {
+        lines.push(line.slice(0, -1));
+        continue;
+      }
+      lines.push(line);
+      return lines.join("\n");
+    }
+  }
+
+  /**
+   * The main prompt. An empty line returns "" (ask again), not "exit";
+   * null means the user wants out (Ctrl+D, or Ctrl+C twice).
+   * End a line with \ to continue on the next; pasted lines are kept together.
+   */
+  async ask(promptStr = "> "): Promise<string | null> {
+    console.log();
+    const answer = await this._prompt(cBold(cAccent(promptStr)), {
+      history: true,
+      multiline: true,
+      onSigint: (pending) => {
+        if (pending) {
+          this._lastInterrupt = 0;
+          return "clear"; // drop what was typed, stay at the prompt
+        }
+        const now = Date.now();
+        if (now - this._lastInterrupt < 2_000) return "exit";
+        this._lastInterrupt = now;
+        output.write(`\n  ${cMuted("(press ctrl-c again, or ctrl-d, to exit)")}`);
+        return "stay";
+      }
+    });
+    return answer == null ? null : answer.trim();
   }
 
   async approve(reason: string): Promise<boolean> {
     console.log();
-    console.log(`  ${cBold(cTool(reason))}`);
-    const rl = readline.createInterface({ input, output });
-    try {
-      const answer = await rl.question(cMuted("  allow? (y/n)> "));
-      return answer.trim().toLowerCase().startsWith("y");
-    } catch {
-      return false;
-    } finally {
-      rl.close();
-    }
+    console.log(`  ${cBold(cTool(sanitize(reason)))}`);
+    const answer = await this._prompt(cMuted("  allow? (y/n)> "), {
+      onSigint: () => {
+        this.onInterrupt?.();
+        return "exit";
+      }
+    });
+    return Boolean(answer?.trim().toLowerCase().startsWith("y"));
+  }
+
+  /** ask_user: a question from the agent, with optional numbered choices. */
+  async question(question: string, choices?: string[]): Promise<string | null> {
+    console.log();
+    console.log(`  ${cBold(cAccent("agent asks"))} ${sanitize(question)}`);
+    choices?.forEach((choice, i) => console.log(`    ${cMuted(`${i + 1}.`)} ${sanitize(choice)}`));
+    const answer = await this._prompt(cMuted("  answer> "), {
+      onSigint: () => {
+        this.onInterrupt?.();
+        return "exit";
+      }
+    });
+    const n = Number(answer?.trim());
+    if (choices && Number.isInteger(n) && n >= 1 && n <= choices.length) return choices[n - 1];
+    return answer;
   }
 
   note(text: string): void {
@@ -302,16 +514,9 @@ export class UI {
       console.log(`    ${cMuted(`${num}  ${row}`)}`);
     });
 
-    const rl = readline.createInterface({ input, output });
-    try {
-      const answer = await rl.question(cMuted("\n  number> "));
-      const num = parseInt(answer.trim(), 10);
-      return !isNaN(num) && num >= 0 && num < rows.length ? num : null;
-    } catch {
-      return null;
-    } finally {
-      rl.close();
-    }
+    const answer = await this._prompt(cMuted("\n  number> "), {});
+    const num = parseInt(answer?.trim() ?? "", 10);
+    return !isNaN(num) && num >= 0 && num < rows.length ? num : null;
   }
 
   // -------------------------------------------------------------- output
@@ -322,12 +527,31 @@ export class UI {
 
   agent(text: string): void {
     console.log(`\n  ${cBold(cAccent("agent"))}`);
-    const formatted = formatMarkdown(text.trim());
+    const formatted = formatMarkdown(sanitize(text.trim()));
     const indented = formatted
       .split("\n")
       .map((l) => `    ${l}`)
       .join("\n");
     console.log(indented);
+  }
+
+  /** Print the model's answer as it arrives. */
+  stream(chunk: string): void {
+    if (!this._streaming) {
+      this.stopWorking();
+      console.log(`\n  ${cBold(cAccent("agent"))}`);
+      output.write("    ");
+      this._streaming = true;
+    }
+    output.write(sanitize(chunk).replace(/\n/g, "\n    "));
+  }
+
+  /** End a streamed answer. Returns whether one was in progress. */
+  endStream(): boolean {
+    if (!this._streaming) return false;
+    output.write("\n");
+    this._streaming = false;
+    return true;
   }
 
   tool(
@@ -340,62 +564,38 @@ export class UI {
       return this.todos(args.todos);
     }
 
+    const resultLines = this._format_result_lines(result);
+    const paddingLeft = nested ? 6 : 2;
+
     if (name === "plan_task") {
-      const header = `${cBold(cAccent("planner"))} ${cMuted(args.goal || this._format_args(args))}`;
-      const resultLines = this._format_result_lines(result);
-      const content = [header, "__DIVIDER__", ...resultLines];
-      const panel = renderPanel(content, {
-        borderColor: cAccent,
-        paddingLeft: nested ? 6 : 2
-      });
-      console.log("\n" + panel);
+      const header = `${cBold(cAccent("planner"))} ${cMuted(this._short(args.goal) || this._format_args(name, args))}`;
+      console.log("\n" + renderPanel([header, "__DIVIDER__", ...resultLines], { borderColor: cAccent, paddingLeft }));
       return;
     }
 
     if (name === "work_task") {
-      const header = `${cBold(cTool("worker"))} ${cMuted(this._format_args(args))}`;
-      const resultLines = this._format_result_lines(result);
-      const content = [header, "__DIVIDER__", ...resultLines];
-      const panel = renderPanel(content, {
-        borderColor: cTool,
-        paddingLeft: nested ? 6 : 2
-      });
-      console.log("\n" + panel);
+      const header = `${cBold(cTool("worker"))} ${cMuted(this._format_args(name, args))}`;
+      console.log("\n" + renderPanel([header, "__DIVIDER__", ...resultLines], { borderColor: cTool, paddingLeft }));
       return;
     }
 
     if (name === "review_task") {
-      const isApproved = result.includes("VERDICT: APPROVED");
+      // The verdict is the first line of a structured result; text quoted
+      // further down cannot flip it.
+      const isApproved = result.startsWith("VERDICT: APPROVED");
       const titleColor = isApproved ? cUser : cTool;
       const verdictLabel = isApproved ? "reviewer · approved" : "reviewer · changes requested";
-      const header = `${cBold(titleColor(verdictLabel))} ${cMuted(args.goal || this._format_args(args))}`;
-      const resultLines = this._format_result_lines(result);
-      const content = [header, "__DIVIDER__", ...resultLines];
-      const panel = renderPanel(content, {
-        borderColor: titleColor,
-        paddingLeft: nested ? 6 : 2
-      });
-      console.log("\n" + panel);
+      const header = `${cBold(titleColor(verdictLabel))} ${cMuted(this._short(args.plan_id || args.goal) || "")}`;
+      console.log("\n" + renderPanel([header, "__DIVIDER__", ...resultLines], { borderColor: titleColor, paddingLeft }));
       return;
     }
 
-    const formattedArgs = this._format_args(args);
-    const header = `${cBold(cTool(name))} ${cMuted(formattedArgs)}`;
-
-    const resultLines = this._format_result_lines(result);
-
-    const content = [header, "__DIVIDER__", ...resultLines];
-
-    const panel = renderPanel(content, {
-      borderColor: cBorder,
-      paddingLeft: nested ? 6 : 2
-    });
-
-    console.log("\n" + panel);
+    const header = `${cBold(cTool(name))} ${cMuted(this._format_args(name, args))}`;
+    console.log("\n" + renderPanel([header, "__DIVIDER__", ...resultLines], { borderColor: cBorder, paddingLeft }));
   }
 
   subagent(description: string): void {
-    const lines = description.trim().split("\n").map(cMuted);
+    const lines = sanitize(description).trim().split("\n").map(cMuted);
     const panel = renderPanel(lines, {
       title: "subagent · own context",
       titleColor: (t) => cBold(cAccent(t)),
@@ -403,6 +603,17 @@ export class UI {
       paddingLeft: 4
     });
     console.log("\n" + panel);
+  }
+
+  /** One line per finished subagent: what it cost. */
+  spend(label: string, spend: SpendLine): void {
+    const hit = spend.promptTokens > 0 ? ` (${Math.round((spend.cachedTokens / spend.promptTokens) * 100)}% cached)` : "";
+    console.log(
+      `\n      ${cMuted(
+        `${label} · ${spend.calls} call${spend.calls === 1 ? "" : "s"} · ` +
+        `${spend.promptTokens.toLocaleString()} prompt${hit} · ${spend.completionTokens.toLocaleString()} completion · ${money(spend.cost)}`
+      )}`
+    );
   }
 
   injection(text: string): void {
@@ -418,7 +629,7 @@ export class UI {
 
   debug(data: any): void {
     const jsonStr = JSON.stringify(data, null, 2);
-    const lines = jsonStr.split("\n").map(cMuted);
+    const lines = sanitize(jsonStr).split("\n").map(cMuted);
     const panel = renderPanel(lines, {
       title: "raw response",
       titleColor: (t) => cItalic(cMuted(t)),
@@ -435,13 +646,14 @@ export class UI {
     for (const todo of todos) {
       const status = todo.status || "pending";
       const mark = MARKS[status] || "○";
+      const content = sanitize(String(todo.content));
 
       if (status === "done") {
-        lines.push(`${cMuted(cStrike(`${mark} ${todo.content}`))}`);
+        lines.push(`${cMuted(cStrike(`${mark} ${content}`))}`);
       } else if (status === "in_progress") {
-        lines.push(`${cBold(cAccent(`${mark} ${todo.content}`))}`);
+        lines.push(`${cBold(cAccent(`${mark} ${content}`))}`);
       } else {
-        lines.push(`${cMuted(`${mark} ${todo.content}`)}`);
+        lines.push(`${cMuted(`${mark} ${content}`)}`);
       }
     }
 
@@ -457,13 +669,13 @@ export class UI {
 
   compacted(before: number, messages: any[]): void {
     const summaryMsg = messages.find(
-      (m) => typeof m.content === "string" && m.content.includes("<summary>")
+      (m) => m.role === "user" && typeof m.content === "string" && m.content.startsWith("<summary>")
     );
     const summary = summaryMsg
       ? summaryMsg.content.replace("<summary>", "").replace("</summary>", "").trim()
       : "(no summary)";
 
-    const formatted = formatMarkdown(summary);
+    const formatted = formatMarkdown(sanitize(summary));
     const panel = renderPanel(formatted, {
       title: `compacted · ${before} → ${messages.length} messages`,
       titleColor: (t) => cBold(cTool(t)),
@@ -480,7 +692,7 @@ export class UI {
     this.stopWorking();
 
     const isTTY = Boolean(process.stdout.isTTY);
-    if (!isTTY) {
+    if (!isTTY || this._streaming) {
       return { stop: () => {} };
     }
 
@@ -513,7 +725,7 @@ export class UI {
 
   // -------------------------------------------------------------- usage & summary
 
-  usage(stats: Record<string, number | null | undefined>): void {
+  usage(stats: Record<string, number | null | undefined>, indent = 2): void {
     for (const [key, value] of Object.entries(stats)) {
       if (value != null) {
         this._totals[key] = (this._totals[key] || 0) + value;
@@ -529,7 +741,7 @@ export class UI {
     }
 
     if (parts.length > 0) {
-      console.log(`\n  ${cMuted(parts.join("  ·  "))}`);
+      console.log(`\n${" ".repeat(indent)}${cMuted(parts.join("  ·  "))}`);
     }
   }
 
@@ -538,6 +750,8 @@ export class UI {
     generationSpeed?: string;
     ttft?: string;
     totalCost?: string;
+    cacheHit?: string;
+    byRole?: string;
   }): void {
     console.log();
     const rows: Array<{ label: string; value: string }> = [];
@@ -550,8 +764,13 @@ export class UI {
         });
       }
     }
+    // per turn: the next summary starts from zero
+    this._totals = {};
 
     if (extraMetrics) {
+      if (extraMetrics.cacheHit) {
+        rows.push({ label: "cache hit (main)", value: extraMetrics.cacheHit });
+      }
       if (extraMetrics.ttft) {
         rows.push({ label: "time to first token", value: extraMetrics.ttft });
       }
@@ -563,6 +782,9 @@ export class UI {
       }
       if (extraMetrics.totalCost) {
         rows.push({ label: "final cost", value: extraMetrics.totalCost });
+      }
+      if (extraMetrics.byRole) {
+        rows.push({ label: "cost by role", value: extraMetrics.byRole });
       }
     }
 
@@ -590,7 +812,11 @@ export class UI {
 
     for (const message of messages) {
       if (message.role === "user") {
-        this.user(message.content);
+        if (typeof message.content === "string" && message.content.startsWith("<summary>")) {
+          this.compacted(messages.length, [message]);
+        } else {
+          this.user(String(message.content ?? ""));
+        }
       } else if (message.role === "assistant") {
         if (message.content) {
           this.agent(message.content);
@@ -612,17 +838,35 @@ export class UI {
 
   // -------------------------------------------------------------- helpers
 
-  private _format_args(args: Record<string, any>): string {
+  private _short(value: unknown, max = 160): string {
+    if (value == null) return "";
+    const text = sanitize(typeof value === "string" ? value : JSON.stringify(value)).replace(/\s+/g, " ").trim();
+    return text.length > max ? `${text.slice(0, max)}…` : text;
+  }
+
+  /** Headline arguments: a path and a size for edits, not the whole file. */
+  private _format_args(name: string, args: Record<string, any>): string {
+    const size = (v: unknown) => (typeof v === "string" ? `${v.length.toLocaleString()} chars` : "?");
+    if (name === "write_file") {
+      return `${this._short(args.path)} (${size(args.content)})`;
+    }
+    if (name === "str_replace" || name === "string_replace") {
+      return `${this._short(args.path)} (${size(args.old_str)} → ${size(args.new_str)})`;
+    }
+    if (name === "work_task") {
+      return [args.plan_id, args.plan ? `plan ${size(args.plan)}` : "", this._short(args.instructions, 100)]
+        .filter(Boolean)
+        .join(" · ");
+    }
     const keys = Object.keys(args);
     if (keys.length === 1) {
-      const val = args[keys[0]];
-      return typeof val === "string" ? val : JSON.stringify(val);
+      return this._short(args[keys[0]], 300);
     }
-    return JSON.stringify(args);
+    return this._short(args, 300);
   }
 
   private _format_result_lines(result: string): string[] {
-    const rawLines = result.trim().split(/\r?\n/);
+    const rawLines = sanitize(result).trim().split(/\r?\n/);
     const lines = rawLines.length > 0 && rawLines[0] !== "" ? rawLines : ["(no output)"];
     const shown = lines.slice(0, MAX_TOOL_OUTPUT_LINES);
 

@@ -1,44 +1,36 @@
 import type { Tool } from "./types.js";
-import type { ChatFunctionTool } from "@openrouter/sdk/models";
 import { bashTool } from "./bash.js";
 import { readFileTool } from "./readFile.js";
 import { readSkillTool } from "./readSkill.js";
 import { browserTool } from "./browser.js";
+import { grepTool, globTool } from "./search.js";
 import { runSubagent } from "../subagent.js";
 import { config } from "../config.js";
 
 export const MAX_TURNS = config.subagentMaxTurns || 15;
 
 /**
- * Structural guarantee: tools withheld from the research subagent.
- */
-export const WITHHELD = new Set([
-  "task",
-  "write_todos",
-  "str_replace",
-  "string_replace",
-  "write_file"
-]);
-
-/**
- * Tools structurally offered to the research subagent (read-only exploration tools).
+ * The research subagent's tools - read-only exploration. This allowlist is
+ * the whole guarantee: a tool not on it is never offered, so the researcher
+ * cannot recurse into `task`, touch the plan, or edit. Its run is also
+ * read-only at the permission gate, so a command that would need approval
+ * is refused rather than asked.
  */
 export const SUBAGENT_TOOLS: Tool[] = [
   bashTool,
   readFileTool,
+  grepTool,
+  globTool,
   readSkillTool,
   browserTool
 ];
-
-export const SUBAGENT_TOOL_SCHEMAS: ChatFunctionTool[] = SUBAGENT_TOOLS.map(
-  (t) => t.schema
-);
 
 export function getSubagentSystemPrompt(): string {
   const cwd = process.cwd();
   return `You are a research subagent. Your job is to explore the codebase and answer the task question.
 You only read and inspect; you never edit.
-Be concise and specific. Cite exact file paths, line numbers, function names, and error text.
+Search in batches: one grep or glob that covers several candidates beats several narrow ones.
+Be concise and specific - aim for under 150 words. Cite exact file paths, line numbers, function names, and error text.
 When your exploration is complete, summarize your findings directly. Do not call any more tools once you have the answer.
 
 Your current working directory is: ${cwd}`;
@@ -84,7 +76,8 @@ export const taskTool: Tool<TaskArgs, string> = {
       systemPrompt: getSubagentSystemPrompt(),
       allowedTools: SUBAGENT_TOOLS,
       maxTurns: MAX_TURNS,
-      label: "subagent"
+      label: "subagent",
+      readOnly: true
     });
   }
 };

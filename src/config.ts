@@ -1,9 +1,27 @@
 import dotenv from "dotenv";
 import { formatSkillsPrompt } from "./skills.js";
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
-export function getSystemPrompt(): string {
+/**
+ * "default": the agent codes, and may run the pipeline for big jobs.
+ * "pipeline": the agent only coordinates subagents (/pipeline, --pipeline).
+ */
+export type Mode = "default" | "pipeline";
+
+const maxRework = Number(process.env.MAX_REWORK) || 2;
+
+const PIPELINE_STEPS = `1. plan_task - a planner subagent explores the code and writes a plan with
+   acceptance criteria. The plan is saved and you get back its plan_id.
+2. work_task with that plan_id - a worker subagent implements it and runs the tests.
+3. review_task with the same plan_id - a reviewer subagent checks every change
+   (new files included) against the plan and returns a structured verdict.
+If the verdict is changes_requested, call work_task again with the same plan_id
+and the reviewer's issues as instructions. The harness allows ${maxRework} rework
+cycle(s) per plan; after that, stop and report the open issues to the user.
+Pass plans by plan_id - never paste a plan into work_task yourself.`;
+
+export function getSystemPrompt(mode: Mode = "default"): string {
   if (process.env.SYSTEM_PROMPT) {
     const skillsSection = formatSkillsPrompt();
     return skillsSection
@@ -17,10 +35,27 @@ export function getSystemPrompt(): string {
     ? `You have skills available. Each one is a set of instructions for a task.\nIf a skill matches what the user wants, call read_skill first and follow it.\n\n${skillsSection}`
     : "You have skills available. Each one is a set of instructions for a task.\nIf a skill matches what the user wants, call read_skill first and follow it.";
 
-  return `You are a coding agent. Your job is to code. Always code.
-Use the bash tool to inspect files.
-Use write_file to create files and str_replace to edit them.
-Answer back to the user once exploration is done.
+  const role =
+    mode === "pipeline"
+      ? `You are a coding agent running in pipeline mode. You coordinate subagents
+and talk to the user; you do not edit files yourself, and your bash is
+read-only. Every change is made by a worker subagent:
+
+${PIPELINE_STEPS}
+
+Do the high-level planning and all communication with the user yourself.`
+      : `You are a coding agent. You make the changes yourself: look around with
+grep, glob and bash, read files with read_file, create files with write_file
+and edit them with str_replace. Answer the user once the work is done. If
+something essential is ambiguous, ask with ask_user instead of guessing.
+
+For a large multi-file feature or refactor - or whenever the user asks for
+the pipeline - coordinate subagents instead of editing yourself:
+${PIPELINE_STEPS}
+Once you call plan_task, the harness limits you to the coordination tools and
+read-only bash for the rest of the turn.`;
+
+  return `${role}
 
 For any task that takes more than one step, call write_todos first and plan it
 out. Send the whole list every time you call it - it replaces the old one.
@@ -37,22 +72,18 @@ way there yourself. It explores in its own context window and hands you back
 just the findings, so the search does not fill yours. It cannot see this
 conversation, so write the question so it stands alone.
 
-For multi-step features or refactors, coordinate specialized subagents:
-- Call plan_task to have a planner subagent explore dependencies and draft a detailed plan.
-- Call work_task to have a worker subagent implement the code changes and run tests.
-- Call review_task to have a reviewer subagent audit git diffs against acceptance criteria.
-If review_task requests changes, dispatch work_task again with the reviewer's critique before finishing.
-Do all high-level planning and user communication yourself.
-
 Long tool output is cut short, and the whole thing is written to a temp file
-whose path is given at the cut. Page through it with head, tail, sed -n or
-grep rather than asking for it again. That file only exists for the current
-turn, so read it now or re-run the command later.
+whose path is given at the cut. Page through it with read_file (offset and
+limit) or grep rather than asking for it again. That file only exists for the
+current turn, so read it now or re-run the command later.
 
 Your current working directory is: ${cwd}
 
 ${skillsText}`.trim();
 }
+
+const list = (value: string | undefined, fallback: string[]): string[] =>
+  value ? value.split(",").map((v) => v.trim()).filter(Boolean) : fallback;
 
 export const config = {
   apiKey: process.env.OPENROUTER_API_KEY || "",
@@ -60,14 +91,28 @@ export const config = {
   get systemPrompt(): string {
     return getSystemPrompt();
   },
-  provider: {
-    only: ["together"],
-    allowFallbacks: false
-  },
+  // Routing used to be pinned to Together with fallbacks off, so any MODEL
+  // Together does not serve (every Anthropic model, for one) could not run.
+  // PROVIDER_ONLY="together" restores the old behaviour.
+  provider: process.env.PROVIDER_ONLY
+    ? { only: process.env.PROVIDER_ONLY.split(",").map((p) => p.trim()), allowFallbacks: false }
+    : undefined,
   contextWindow: Number(process.env.CONTEXT_WINDOW) || 64_000,
   compactAt: Number(process.env.COMPACT_AT) || 0.85,
   compactTo: Number(process.env.COMPACT_TO) || 0.35,
+  // Stripping a finished turn costs one re-prefill of it. Below this share of
+  // the window that costs more than the tokens it saves, so results stay whole.
+  stripAfter: Number(process.env.STRIP_AFTER ?? 0.25),
   toolCap: Number(process.env.TOOL_CAP) || 10_000,
   toolStub: Number(process.env.TOOL_STUB) || 300,
-  subagentMaxTurns: Number(process.env.SUBAGENT_MAX_TURNS) || 15
+  subagentMaxTurns: Number(process.env.SUBAGENT_MAX_TURNS) || 15,
+  subagentTimeoutMs: Number(process.env.SUBAGENT_TIMEOUT_MS) || 600_000,
+  maxSteps: Number(process.env.MAX_STEPS) || 60,
+  maxRework,
+  // Send providers' thinking blocks back during tool loops (some require it).
+  reasoningRoundTrip: process.env.REASONING_ROUNDTRIP !== "0",
+  // browser `open` needs approval for any host not on this list.
+  browserAllowHosts: list(process.env.BROWSER_ALLOW_HOSTS, ["localhost", "127.0.0.1", "[::1]"]),
+  // Session logs live here, never inside the project being worked on.
+  sessionDir: process.env.SESSION_DIR || ""
 };

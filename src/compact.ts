@@ -8,11 +8,15 @@
  * the codebase that throws information away for good. It runs rarely and cuts
  * deep - trimming just enough to fit would put us back over the line next turn,
  * and every trim costs the whole prompt cache.
+ *
+ * One thing is never summarised: what the user actually typed. Requests are
+ * pinned verbatim into the note and carried forward by every later compaction,
+ * so a summary of a summary cannot paraphrase a constraint out of existence.
  */
 
 import type { ChatMessages } from "@openrouter/sdk/models";
 import { config } from "./config.js";
-import { estimate, strip } from "./history.js";
+import { elide, estimate, live, strip, HANDOFF_OPENING } from "./history.js";
 import { callLLM } from "./llm.js";
 
 export const SYSTEM_PROMPT = `You are compacting the transcript of a coding session. The session is out of
@@ -44,29 +48,69 @@ Rules:
 - Never invent progress. If something was not finished, say it was not.
 - No preamble and no sign-off. Start at the first heading.`;
 
-export const HANDOFF = `<summary>
-Everything before this point has been compacted out of the context window to
+export const HANDOFF = `${HANDOFF_OPENING} out of the context window to
 free up room. This is the record of it - treat it as your own memory of the
 work so far, not as something the user told you.
 
+The user's requests below are quoted exactly and are carried through every
+compaction. Where the notes after them disagree, the requests win.
+{requests}
+
 {summary}
 </summary>`;
+
+const PIN_EACH = 2_000; // chars kept of one request
+const PIN_TOTAL = 6_000; // chars kept across all of them
 
 /**
  * Has the last request grown past the point where we rebuild?
  */
 export function needed(
   usage?: { prompt_tokens?: number } | null,
-  messages?: ChatMessages[]
+  messages?: ChatMessages[],
+  overhead = 0
 ): boolean {
   const threshold = config.contextWindow * config.compactAt;
   if (usage?.prompt_tokens != null && usage.prompt_tokens > 0) {
     return usage.prompt_tokens > threshold;
   }
   if (messages) {
-    return estimate(messages) > threshold;
+    return estimate(messages) + overhead > threshold;
   }
   return false;
+}
+
+function isHandoff(message: ChatMessages): boolean {
+  return message.role === "user" && typeof message.content === "string" && message.content.startsWith(HANDOFF_OPENING);
+}
+
+/**
+ * The user's own words in `messages`, oldest first, including any already
+ * pinned by an earlier compaction. Always keeps the first (the original task),
+ * then as many of the newest as fit.
+ */
+export function pinned(messages: ChatMessages[]): string[] {
+  const requests: string[] = [];
+  for (const message of messages) {
+    const content = typeof message.content === "string" ? message.content : "";
+    if (isHandoff(message)) {
+      for (const match of content.matchAll(/<request>\n([\s\S]*?)\n<\/request>/g)) requests.push(match[1]);
+    } else if (message.role === "user" && content.trim()) {
+      const quoted = content.replaceAll("</request>", "</ request>");
+      requests.push(quoted.length > PIN_EACH ? `${quoted.slice(0, PIN_EACH)} [...]` : quoted);
+    }
+  }
+  const unique = requests.filter((r, i) => requests.indexOf(r) === i);
+  if (unique.length === 0) return unique;
+
+  const kept = [unique[0]];
+  let total = unique[0].length;
+  const newest: string[] = [];
+  for (let i = unique.length - 1; i > 0 && total + unique[i].length <= PIN_TOTAL; i--) {
+    newest.unshift(unique[i]);
+    total += unique[i].length;
+  }
+  return [...kept, ...newest];
 }
 
 const ROLES: Record<string, string> = {
@@ -76,7 +120,9 @@ const ROLES: Record<string, string> = {
 };
 
 /**
- * Flatten the transcript into something the summariser can read.
+ * Flatten the transcript into something the summariser can read. An earlier
+ * handoff note is labelled as one - rendered as USER it reads as the user
+ * speaking, and each generation drifts further from what they actually said.
  */
 export function render(messages: ChatMessages[]): string {
   const lines: string[] = [];
@@ -98,24 +144,27 @@ export function render(messages: ChatMessages[]): string {
       content += `\n[called ${fnName}: ${fnArgs}]`;
     }
 
-    const role = ROLES[message.role] || message.role.toUpperCase();
+    const role = isHandoff(message)
+      ? "EARLIER HANDOFF NOTE"
+      : ROLES[message.role] || message.role.toUpperCase();
     lines.push(`${role}: ${content}`);
   }
   return lines.join("\n\n");
 }
 
 /**
- * One LLM call, no tools. Returns the handoff note.
+ * One LLM call, no tools. Returns the handoff note and what it cost.
  */
-export async function summarize(messages: ChatMessages[]): Promise<string> {
+export async function summarize(messages: ChatMessages[]): Promise<{ text: string; cost: number }> {
   const response = await callLLM(
     [
       { role: "system", content: SYSTEM_PROMPT },
       { role: "user", content: render(messages) }
     ],
-    null
+    null,
+    { role: "compaction" }
   );
-  return response.message.content || "";
+  return { text: response.message.content || "", cost: response.usage?.cost ?? 0 };
 }
 
 /**
@@ -155,18 +204,40 @@ export function tailStart(messages: ChatMessages[], budget: number): number {
   return safeBoundary(messages, 1);
 }
 
+export interface Compaction {
+  before: number;
+  after: number;
+  cost: number;
+}
+
 /**
- * system + summary + a recent tail. The caller freezes what comes back.
+ * system + summary + a recent tail, rewritten in place. The caller freezes
+ * what comes back.
+ *
+ * `force` (the /compact command) summarises everything but the newest
+ * exchange even when the transcript is still small; otherwise the tail kept
+ * verbatim is COMPACT_TO of the window and a short session has nothing old
+ * enough to summarise.
  */
-export async function compact(messages: ChatMessages[]): Promise<ChatMessages[]> {
-  const budget = config.contextWindow * config.compactTo;
+export async function compact(messages: ChatMessages[], force = false): Promise<Compaction> {
+  const before = messages.length;
+  const budget = force ? 0 : config.contextWindow * config.compactTo;
   const cut = tailStart(messages, budget);
   if (cut <= 1) {
-    return messages; // nothing old enough to be worth summarising
+    return { before, after: before, cost: 0 }; // nothing old enough to be worth summarising
   }
 
-  const summary = await summarize(messages.slice(1, cut));
-  const handoffContent = HANDOFF.replace("{summary}", summary);
+  const old = messages.slice(1, cut);
+  const { text, cost } = await summarize(old);
+  const requests = pinned(old)
+    .map((r) => `<request>\n${r}\n</request>`)
+    .join("\n");
+  // One pass with a replacer function: String.replace expands $$, $& and $'
+  // in a replacement *string*, and summaries of shell sessions are full of
+  // them; a second pass could also rewrite a "{summary}" the user typed.
+  const handoffContent = HANDOFF.replace(/\{(requests|summary)\}/g, (_, key) =>
+    key === "requests" ? requests || "(none)" : text
+  );
 
   const kept: ChatMessages[] = [
     messages[0],
@@ -175,11 +246,11 @@ export async function compact(messages: ChatMessages[]): Promise<ChatMessages[]>
   ];
 
   // Shrink the retained tail now, while we are already paying for a rebuilt
-  // prefix. Stripping is idempotent, so from here the frozen block is final
-  // and stays byte-identical - and cached - until the next compaction.
-  strip(kept);
+  // prefix - but not the newest results, which the model has not read yet.
+  strip(kept, true);
+  elide(kept, live(kept));
 
   // In-place update so caller references stay in sync
   messages.splice(0, messages.length, ...kept);
-  return kept;
+  return { before, after: messages.length, cost };
 }

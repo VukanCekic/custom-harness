@@ -13,6 +13,76 @@ export interface BrowserToolArgs {
   js?: string;
 }
 
+export interface BrowserIntent {
+  action?: BrowserToolArgs["action"];
+  url?: string;
+  ref?: string;
+  text?: string;
+  key?: string;
+  ms?: number;
+  js?: string;
+}
+
+/**
+ * The action the tool will really take, shorthand `command` included. The
+ * permission rules read this too, so what gets approved is what runs.
+ */
+export function parseBrowserArgs(args: BrowserToolArgs): BrowserIntent {
+  let action = args.action;
+  let url = args.url;
+  let ref = args.ref;
+  let text = args.text;
+  let key = args.key;
+  let ms = args.ms;
+  let js = args.js;
+
+  // Parse shorthand command if provided
+  if (args.command) {
+    const trimmed = args.command.trim();
+    const parts = trimmed.split(/\s+/);
+    const cmd = parts[0]?.toLowerCase();
+    const rest = trimmed.slice(cmd.length).trim().replace(/^["']|["']$/g, "");
+
+    if (cmd === "open" || cmd === "goto") {
+      action = "open";
+      url = rest;
+    } else if (cmd === "snapshot" || cmd === "snap") {
+      action = "snapshot";
+    } else if (cmd === "click") {
+      action = "click";
+      ref = rest;
+    } else if (cmd === "press") {
+      action = "press";
+      key = rest;
+    } else if (cmd === "wait" || cmd === "sleep") {
+      action = "wait";
+      ms = parseInt(rest, 10);
+    } else if (cmd === "eval" || cmd === "evaluate") {
+      action = "eval";
+      js = rest;
+    } else if (cmd === "close" || cmd === "stop") {
+      action = "close";
+    } else if (cmd === "keyboard") {
+      action = "type";
+      text = rest.replace(/^type\s+/i, "");
+    } else if (cmd === "type" || cmd === "fill") {
+      action = "type";
+      ref = parts[1];
+      text = parts.slice(2).join(" ");
+      if (!text) {
+        text = ref;
+        ref = undefined;
+      }
+    }
+  }
+  return { action, url, ref, text, key, ms, js };
+}
+
+/** The URL `open` will navigate to. */
+export function browserTarget(url: string): string {
+  return /^[a-z][a-z0-9+.-]*:/i.test(url) ? url : `https://${url}`;
+}
+
 let browser: BrowserClaw | null = null;
 let page: CrawlPage | null = null;
 
@@ -101,53 +171,7 @@ export const browserTool: Tool<BrowserToolArgs, string> = {
     }
   },
   execute: async (args: BrowserToolArgs) => {
-    let action = args.action;
-    let url = args.url;
-    let ref = args.ref;
-    let text = args.text;
-    let key = args.key;
-    let ms = args.ms;
-    let js = args.js;
-
-    // Parse shorthand command if provided
-    if (args.command) {
-      const trimmed = args.command.trim();
-      const parts = trimmed.split(/\s+/);
-      const cmd = parts[0]?.toLowerCase();
-      const rest = trimmed.slice(cmd.length).trim().replace(/^["']|["']$/g, "");
-
-      if (cmd === "open" || cmd === "goto") {
-        action = "open";
-        url = rest;
-      } else if (cmd === "snapshot" || cmd === "snap") {
-        action = "snapshot";
-      } else if (cmd === "click") {
-        action = "click";
-        ref = rest;
-      } else if (cmd === "press") {
-        action = "press";
-        key = rest;
-      } else if (cmd === "wait" || cmd === "sleep") {
-        action = "wait";
-        ms = parseInt(rest, 10);
-      } else if (cmd === "eval" || cmd === "evaluate") {
-        action = "eval";
-        js = rest;
-      } else if (cmd === "close" || cmd === "stop") {
-        action = "close";
-      } else if (cmd === "keyboard") {
-        action = "type";
-        text = rest.replace(/^type\s+/i, "");
-      } else if (cmd === "type" || cmd === "fill") {
-        action = "type";
-        ref = parts[1];
-        text = parts.slice(2).join(" ");
-        if (!text) {
-          text = ref;
-          ref = undefined;
-        }
-      }
-    }
+    const { action, url, ref, text, key, ms, js } = parseBrowserArgs(args);
 
     if (action === "close") {
       await closeBrowser();
@@ -161,7 +185,7 @@ export const browserTool: Tool<BrowserToolArgs, string> = {
       switch (action) {
         case "open": {
           if (!url) return "Error: url is required";
-          const target = url.startsWith("http") ? url : `https://${url}`;
+          const target = browserTarget(url);
           await p.goto(target);
           const pw = await p.playwrightPage();
           await pw.bringToFront().catch(() => {});

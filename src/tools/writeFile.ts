@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "./types.js";
-import { noteRead } from "../context.js";
+import { noteWrite } from "../context.js";
 
 export interface WriteFileArgs {
   path: string;
@@ -39,7 +39,7 @@ export const writeFileTool: Tool<WriteFileArgs, string> = {
       const resolvedPath = path.resolve(process.cwd(), targetPath);
       await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
       await fs.writeFile(resolvedPath, content, "utf-8");
-      noteRead(targetPath);
+      noteWrite(targetPath);
       return `Wrote ${targetPath}`;
     } catch (err: any) {
       return `Error writing file "${targetPath}": ${err.message || String(err)}`;
