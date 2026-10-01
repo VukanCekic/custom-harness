@@ -92,6 +92,15 @@ export interface SessionInfo {
   firstRequest: string;
 }
 
+/**
+ * The session --resume continues: the newest one with a request in it. Every
+ * launch opens a log, so the newest is often just a system prompt from a
+ * start that was quit at once.
+ */
+export function resumable(dir = sessionDir()): SessionInfo | undefined {
+  return listSessions(dir).find((s) => s.firstRequest.trim());
+}
+
 /** This project's sessions, newest first. */
 export function listSessions(dir = sessionDir()): SessionInfo[] {
   if (!fs.existsSync(dir)) return [];
@@ -165,8 +174,8 @@ export class Session {
     }
     for (let index = this.written; index < messages.length; index++) {
       this.append({ type: "message", message: messages[index] });
+      this.written = index + 1; // a failed write is retried next time, not duplicated
     }
-    this.written = messages.length;
   }
 
   replace(messages: ChatMessages[], reason: string): void {

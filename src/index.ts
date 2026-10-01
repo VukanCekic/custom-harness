@@ -16,7 +16,7 @@ import { settle, sweep, HANDOFF_OPENING } from "./history.js";
 import { usesBreakpoints, type Spend } from "./llm.js";
 import { blame, forget } from "./cache.js";
 import { CancelledError } from "./scope.js";
-import { Session, legacyTranscript, listSessions, load, sessionDir } from "./session.js";
+import { Session, legacyTranscript, listSessions, load, resumable, sessionDir } from "./session.js";
 
 const HELP = `Commands:
     /clear      - Start a new session (history, todos and plans cleared, browser closed)
@@ -100,6 +100,22 @@ ui.onInterrupt = () => {
   cancelTurn();
 };
 
+/**
+ * Keep the session log in step. A log that cannot be written (disk full, a
+ * file locked by a virus scanner) must not take the turn down with it.
+ */
+let logBroken = false;
+function record(messages: ChatMessages[], replaced?: string): void {
+  try {
+    if (replaced) session.replace(messages, replaced);
+    else session.sync(messages);
+    logBroken = false;
+  } catch (err: any) {
+    if (!logBroken) ui.note(`session log not updated (${err.message || String(err)}); the turn carries on`);
+    logBroken = true;
+  }
+}
+
 function freshTranscript(): ChatMessages[] {
   return [{ role: "system", content: getSystemPrompt(mode) }];
 }
@@ -130,7 +146,7 @@ async function runTurn(promptText: string): Promise<void> {
       messages: sessionMessages,
       mode,
       signal: turn.signal,
-      onTranscript: (messages) => session.sync(messages),
+      onTranscript: record,
       onChunk: streaming
         ? (chunk) => {
             spinner.stop();
@@ -285,7 +301,7 @@ async function rewind(): Promise<void> {
 }
 
 async function switchSession(): Promise<void> {
-  const sessions = listSessions().filter((s) => s.file !== session.file);
+  const sessions = listSessions().filter((s) => s.file !== session.file && s.firstRequest.trim());
   if (sessions.length === 0) {
     ui.note("No other sessions for this project.");
     return;
@@ -356,10 +372,10 @@ async function command(input: string): Promise<"done" | "exit" | "prompt"> {
       try {
         blame(sessionMessages, "compaction");
         // forced: works on a short transcript too, keeping only the newest exchange verbatim
-        await compact(sessionMessages, true);
+        const done = await compact(sessionMessages, true);
         spinner.stop();
-        if (sessionMessages.length < before) {
-          session.replace(sessionMessages, "compaction");
+        if (done.changed) {
+          record(sessionMessages, "compaction");
           ui.compacted(before, sessionMessages);
         } else {
           ui.note("Nothing to compact yet.");
@@ -412,7 +428,7 @@ async function main() {
   const warning = budgetWarning(sessionMessages[0].content as string);
   if (warning) ui.note(`warning: ${warning}`);
 
-  const latest = isResume ? listSessions().find((s) => s.messages > 0) : undefined;
+  const latest = isResume ? resumable() : undefined;
   if (latest) {
     // continue the old log rather than opening a new one
     sessionMessages = adopt(load(latest.file).messages);

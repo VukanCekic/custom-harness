@@ -44,6 +44,9 @@ export const HANDOFF_OPENING = `${SUMMARY}\nEverything before this point has bee
 
 const DROPPED_NOTE = `${DROPPED} dropped to fit the context window.]`;
 
+const STUB_END = /\n\n\[output stripped: \d+ more chars\. Run the command again if you need them\.\]$/;
+const PARKED = /\[output trimmed: \d+ of \d+ chars cut from the middle\. The whole output is at (.+?) - page through it with head, tail, or read_file\./;
+
 const ELIDE_MIN = 500; // chars - an edit argument shorter than this stays verbatim
 const ELIDE_ANY = 2_000; // chars - any other string argument longer than this goes
 
@@ -56,10 +59,35 @@ export type SpillScope = string[];
 /** The main agent's current turn. Subagents bring their own scope. */
 export const SPILLS: SpillScope = [];
 
+/** Every spill file still on disk, whichever run owns it. */
+const LIVE = new Set<string>();
+const spillKey = (filePath: string) => {
+  const resolved = path.resolve(filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+};
+
+/**
+ * Is this one of the harness's own live spill files? They sit in the OS temp
+ * directory, outside the project, so without this every attempt to page one
+ * needed an approval - and read-only subagents were refused outright.
+ */
+export function isSpill(filePath: string): boolean {
+  return LIVE.has(spillKey(filePath));
+}
+
 function text(message: ChatMessages): string {
   const raw = (message as any)?.content;
   return typeof raw === "string" ? raw : "";
 }
+
+/**
+ * What a result already is, judged by the exact shape strip() and fit() give
+ * it - never by a marker appearing somewhere inside. A result that merely
+ * quotes a marker (reading this file does) used to count as stripped forever,
+ * and fit() priced it as droppable while refusing to drop it.
+ */
+const isStub = (content: string) => STUB_END.test(content);
+const isDropped = (content: string) => content === DROPPED_NOTE;
 
 // ------------------------------------------------------------------- 1. cap
 
@@ -71,6 +99,7 @@ export function spill(text: string, scope: SpillScope = SPILLS): string {
   const filePath = path.join(os.tmpdir(), fileName);
   fs.writeFileSync(filePath, text, "utf-8");
   scope.push(filePath);
+  LIVE.add(spillKey(filePath));
   return filePath;
 }
 
@@ -119,6 +148,7 @@ export function cap(
  */
 export function sweep(scope: SpillScope = SPILLS): void {
   for (const filePath of scope) {
+    LIVE.delete(spillKey(filePath));
     try {
       fs.rmSync(filePath, { force: true });
     } catch {
@@ -185,7 +215,7 @@ export function strip(messages: ChatMessages[], protectLive = false): number {
   for (let index = locked(messages); index < end; index++) {
     const message = messages[index] as any;
     const content = text(message);
-    if (message.role !== "tool" || content.includes(STRIPPED) || content.includes(DROPPED) || content.length <= stubLimit) {
+    if (message.role !== "tool" || isStub(content) || isDropped(content) || content.length <= stubLimit) {
       continue;
     }
     message.content = stub(content);
@@ -288,11 +318,25 @@ export function estimate(messages: ChatMessages[]): number {
 
 /** Re-cap an unread result to SQUEEZE chars, reusing its spill file if it has one. */
 function squeeze(content: string, scope: SpillScope): string {
-  const parked = content.match(/The whole output is at (.+?) - page through it/)?.[1];
-  if (parked && fs.existsSync(parked)) {
+  // Only a pointer cap() itself wrote, to a file it still owns - not a path
+  // that happens to appear in the output.
+  const parked = content.match(PARKED)?.[1];
+  if (parked && isSpill(parked) && fs.existsSync(parked)) {
     return cap(fs.readFileSync(parked, "utf-8"), scope, SQUEEZE, parked);
   }
   return cap(content, scope, SQUEEZE);
+}
+
+/** What squeeze() would leave of a message, priced without writing a file. */
+function squeezedSize(message: ChatMessages): number {
+  const content = text(message);
+  const head = Math.floor(SQUEEZE * 0.7);
+  const pointer =
+    `\n\n${TRIMMED} ${content.length} of ${content.length} chars cut from the middle. The whole output is at ` +
+    `${path.join(os.tmpdir(), "customharness-tool-0000000000000-000000.txt")} - page through it with ` +
+    "head, tail, or read_file. It is deleted when this turn ends.]\n\n";
+  const kept = content.slice(0, head) + pointer + content.slice(content.length - (SQUEEZE - head));
+  return estimate([{ ...(message as any), content: kept } as ChatMessages]);
 }
 
 export interface Fit {
@@ -308,10 +352,11 @@ export interface Fit {
 /**
  * Last resort: shrink tool results until the request fits.
  *
- * Prices the deepest possible cut before making any. If even that cannot
- * reach the budget, nothing is touched - throwing every result away on the
- * way to failing anyway is how past runs went blind - and the caller has to
- * compact or stop instead. Normally a no-op: cap, strip and compaction do the
+ * Prices the deepest possible cut before making any, and works on a copy
+ * that is committed only if it fits. Either the request fits afterwards or
+ * the transcript is exactly as it was: throwing results away on the way to
+ * failing anyway is how past runs went blind. When it cannot fit, the caller
+ * has to compact or stop. Normally a no-op: cap, strip and compaction do the
  * real work.
  */
 export function fit(
@@ -321,7 +366,8 @@ export function fit(
   scope: SpillScope = SPILLS
 ): Fit {
   const sizes = messages.map((m) => estimate([m]));
-  let tokens = overhead + sizes.reduce((sum, n) => sum + n, 0);
+  const total = overhead + sizes.reduce((sum, n) => sum + n, 0);
+  let tokens = total;
   const result: Fit = { tokens, floor: tokens, fits: tokens <= budget, stubbed: 0, elided: 0, dropped: 0, squeezed: 0 };
   if (result.fits) {
     return result;
@@ -331,72 +377,81 @@ export function fit(
   const read: number[] = [];
   const unread: number[] = [];
   // Tool-call arguments used to be irreducible: one 200k-char write_file
-  // could put a request out of reach for good.
+  // could put a request out of reach for good. The call whose results are
+  // still unread keeps its reasoning: its tool loop is not over.
   const slim = new Map<number, ChatMessages>();
   for (let index = locked(messages); index < messages.length; index++) {
     if (messages[index].role === "tool") {
       (index < fresh ? read : unread).push(index);
     }
-    const next = slimmed(messages[index]);
+    const next = index === fresh - 1 && fresh < messages.length ? null : slimmed(messages[index]);
     if (next) slim.set(index, next);
   }
+  const squeezable = (index: number) => text(messages[index]).length > SQUEEZE + 400;
 
+  // The deepest cut, priced by the same rules the passes below follow.
   const droppedSize = estimate([{ role: "tool", toolCallId: "", content: DROPPED_NOTE } as ChatMessages]);
-  const squeezedSize = Math.ceil((SQUEEZE + 400) / 4);
   result.floor =
-    tokens -
+    total -
     [...slim].reduce((sum, [i, next]) => sum + Math.max(0, sizes[i] - estimate([next])), 0) -
-    read.reduce((sum, i) => sum + Math.max(0, sizes[i] - droppedSize), 0) -
-    unread.reduce((sum, i) => sum + Math.max(0, sizes[i] - squeezedSize), 0);
+    read.reduce((sum, i) => sum + (isDropped(text(messages[i])) ? 0 : Math.max(0, sizes[i] - droppedSize)), 0) -
+    unread.filter(squeezable).reduce((sum, i) => sum + Math.max(0, sizes[i] - squeezedSize(messages[i])), 0);
   if (result.floor > budget) {
     return result;
   }
 
-  const replace = (index: number, content: string) => {
-    (messages[index] as any).content = content;
-    const next = estimate([messages[index]]);
-    tokens += next - sizes[index];
-    sizes[index] = next;
+  // Entries of the copy are replaced, never edited, so the original is
+  // untouched until the commit below.
+  const work = [...messages];
+  const replace = (index: number, next: ChatMessages) => {
+    work[index] = next;
+    const size = estimate([next]);
+    tokens += size - sizes[index];
+    sizes[index] = size;
   };
+  const withContent = (index: number, content: string) => ({ ...(work[index] as any), content }) as ChatMessages;
+  const done = { stubbed: 0, elided: 0, dropped: 0, squeezed: 0 };
 
   // 1. stub what the model has already read, oldest first
   for (const index of read) {
     if (tokens <= budget) break;
-    const content = text(messages[index]);
-    if (content.includes(STRIPPED) || content.includes(DROPPED) || content.length <= STUB) continue;
-    replace(index, stub(content));
-    result.stubbed++;
+    const content = text(work[index]);
+    if (isStub(content) || isDropped(content) || content.length <= STUB) continue;
+    replace(index, withContent(index, stub(content)));
+    done.stubbed++;
   }
 
   // 2. elide the arguments of calls that already ran, oldest first
   for (const [index, next] of slim) {
     if (tokens <= budget) break;
-    messages[index] = next;
-    const size = estimate([next]);
-    tokens += size - sizes[index];
-    sizes[index] = size;
-    result.elided++;
+    replace(index, next);
+    done.elided++;
   }
 
   // 3. then drop what the model has read, oldest first
   for (const index of read) {
     if (tokens <= budget) break;
-    if (text(messages[index]).includes(DROPPED)) continue;
-    replace(index, DROPPED_NOTE);
-    result.dropped++;
+    if (isDropped(text(work[index]))) continue;
+    replace(index, withContent(index, DROPPED_NOTE));
+    done.dropped++;
   }
 
   // 4. only then squeeze what it has not read, biggest first - never to
   //    nothing: the full text stays on disk and the pointer says where
   for (const index of [...unread].sort((a, b) => sizes[b] - sizes[a])) {
     if (tokens <= budget) break;
-    const content = text(messages[index]);
-    if (content.length <= SQUEEZE + 400) continue;
-    replace(index, squeeze(content, scope));
-    result.squeezed++;
+    if (!squeezable(index)) continue;
+    replace(index, withContent(index, squeeze(text(work[index]), scope)));
+    done.squeezed++;
   }
 
-  result.tokens = tokens;
-  result.fits = tokens <= budget;
-  return result;
+  if (tokens > budget) {
+    // The estimate of the floor was a little optimistic. Report the floor
+    // actually reached and leave the transcript alone.
+    return { ...result, floor: tokens };
+  }
+  for (let index = 0; index < work.length; index++) {
+    if (work[index] !== messages[index]) messages[index] = work[index];
+  }
+  return { ...result, ...done, tokens, fits: true };
 }

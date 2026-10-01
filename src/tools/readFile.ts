@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "./types.js";
 import { noteRead } from "../context.js";
+import { CAP } from "../history.js";
 
 export interface ReadFileArgs {
   path: string;
@@ -11,6 +12,7 @@ export interface ReadFileArgs {
 
 const WHOLE_FILE_LIMIT = 2 * 1024 * 1024; // bytes read without offset/limit
 const PAGED_FILE_LIMIT = 64 * 1024 * 1024; // bytes read at all
+const PAGE_CHARS = Math.floor(CAP * 0.9); // a whole read longer than this comes back as its first page
 
 function numbered(lines: string[], first: number): string {
   return lines.map((line, i) => `${first + i}\t${line}`).join("\n");
@@ -84,7 +86,21 @@ export const readFileTool: Tool<ReadFileArgs, string> = {
         return header + numbered(selected, start);
       }
 
-      return numbered(lines, 1);
+      // Too long for the tool cap: hand back the first page and say how to go
+      // on. Capped instead, the numbered text was spilled to a temp file, and
+      // paging that with read_file numbered every line a second time.
+      const whole = numbered(lines, 1);
+      if (whole.length <= PAGE_CHARS) return whole;
+      let end = 0;
+      for (let size = 0; end < lines.length && size + lines[end].length + 8 <= PAGE_CHARS; end++) {
+        size += lines[end].length + 8;
+      }
+      end = Math.max(end, 1);
+      return (
+        `[Lines 1 to ${end} of ${lines.length} - too long to show at once. ` +
+        `Continue with offset=${end + 1}, or grep for what you need.]\n` +
+        numbered(lines.slice(0, end), 1)
+      );
     } catch (err: any) {
       return `Error reading file "${targetPath}": ${err.message || String(err)}`;
     }

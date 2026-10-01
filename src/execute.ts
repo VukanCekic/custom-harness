@@ -51,6 +51,26 @@ export function peek(raw: string | undefined): Record<string, any> {
   }
 }
 
+/**
+ * The reply hit the output-token limit, so its last call is cut off. The
+ * generic "not valid JSON - send the complete call again" made the model
+ * resend the same oversized call until the step limit, paying for the output
+ * each time. Returns the result to record instead of running it, or null if
+ * this call arrived whole.
+ */
+export function cutOff(call: ChatToolCall): string | null {
+  try {
+    JSON.parse(call.function.arguments || "{}");
+    return null;
+  } catch {
+    return (
+      `Error: your reply hit the output-token limit and this ${call.function.name} call was cut off, so nothing was run. ` +
+      "Sending it again will be cut off the same way. Make it smaller: write a long file in parts " +
+      "(write_file with the first part, then str_replace to add the rest), or split the work into several calls."
+    );
+  }
+}
+
 export async function execute(call: ChatToolCall, gate: Gate): Promise<Executed> {
   const name = call.function.name;
 
@@ -77,7 +97,8 @@ export async function execute(call: ChatToolCall, gate: Gate): Promise<Executed>
     };
   }
 
-  const permission = check(name, args);
+  // A caller that cannot ask is read-only: stricter rules, see check().
+  const permission = check(name, args, { strict: !gate.approve });
   const reason = permission.reason || name;
   if (permission.action === "deny") {
     return { args, result: `Permission denied: ${reason} is blocked by security policy.` };

@@ -7,7 +7,7 @@ import { writeFileTool } from "./writeFile.js";
 import { stringReplaceTool } from "./stringReplace.js";
 import { readSkillTool } from "./readSkill.js";
 import { grepTool, globTool } from "./search.js";
-import { runSubagent } from "../subagent.js";
+import { runSubagent, runSubagentDetailed } from "../subagent.js";
 import { git, snapshot } from "../git.js";
 import {
   artifactsDir,
@@ -98,7 +98,7 @@ export const planTool: Tool<PlanTaskArgs, string> = {
   execute: async (args) => {
     const goal = args.goal || args.description || JSON.stringify(args);
     const context = args.context ? `\n\nAdditional Context:\n${args.context}` : "";
-    const report = await runSubagent({
+    const outcome = await runSubagentDetailed({
       role: "planner",
       taskDescription: `Create an implementation plan for the following goal:\n${goal}${context}`,
       systemPrompt: getPlannerPrompt(),
@@ -107,9 +107,16 @@ export const planTool: Tool<PlanTaskArgs, string> = {
       label: "planner",
       readOnly: true
     });
-    if (report.startsWith("(planner ")) {
-      return report; // failed or cancelled - nothing worth storing as a plan
+    if (outcome.status !== "done") {
+      // Partial notes are not a plan. Stored, they became the worker's
+      // instructions ("I was still looking at README.md").
+      return (
+        `The planner did not finish (${outcome.status.replace(/_/g, " ")}), so nothing was saved as a plan. ` +
+        "Call plan_task again with a narrower goal, or ask the user.\n\n" +
+        outcome.text
+      );
     }
+    const report = outcome.text;
     const record = savePlan(`# Goal\n${goal}${context}\n\n${report}`);
     return (
       `Plan saved as plan_id "${record.id}" (${path.relative(process.cwd(), record.path)}). ` +

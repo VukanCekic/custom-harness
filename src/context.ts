@@ -15,7 +15,32 @@ const LABELS: Record<string, string> = {
 const HASH_LIMIT = 1024 * 1024; // bigger files are compared by size and mtime only
 const STATUS_TIMEOUT_MS = 2_000;
 
-const key = (filePath: string) => path.resolve(process.cwd(), filePath);
+/**
+ * One spelling per file. On Windows the same directory can arrive as an 8.3
+ * short name (C:\Users\RUNNER~1\...) from the cwd or TEMP and as the long name
+ * from git; compared as strings they never matched, so the agent's own writes
+ * came back as outside changes. The deepest existing part is resolved through
+ * the filesystem, so files that do not exist yet (or were deleted) still map.
+ */
+function canonical(target: string): string {
+  let current = path.resolve(target);
+  const rest: string[] = [];
+  while (!fs.existsSync(current)) {
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    rest.unshift(path.basename(current));
+    current = parent;
+  }
+  try {
+    current = fs.realpathSync.native(current);
+  } catch {
+    // keep the lexical path
+  }
+  return path.join(current, ...rest);
+}
+
+const key = (filePath: string) => canonical(path.resolve(process.cwd(), filePath));
+const shown = (fullPath: string) => path.relative(canonical(process.cwd()), fullPath) || fullPath;
 
 /** Content fingerprint; for big files size + mtime, which is cheap and good enough. */
 function fingerprint(fullPath: string): string | null {
@@ -44,7 +69,8 @@ function parseStatus(output: string, root: string): GitState {
   return state;
 }
 
-const ROOT = gitSync(["rev-parse", "--show-toplevel"]).trim();
+const TOP = gitSync(["rev-parse", "--show-toplevel"]).trim();
+const ROOT = TOP ? canonical(TOP) : "";
 let lastState: GitState = ROOT ? parseStatus(gitSync(["status", "--porcelain"]), ROOT) : {};
 
 // fingerprint of each file as the agent itself last wrote it
@@ -64,7 +90,7 @@ export async function fileChanges(): Promise<Record<string, string>> {
     const lastVal = lastState[fullPath];
     if (lastVal && lastVal[0] === val[0] && lastVal[1] === val[1]) continue;
     if (WROTE.has(fullPath) && WROTE.get(fullPath) === val[1]) continue;
-    changed[path.relative(process.cwd(), fullPath) || fullPath] = val[0];
+    changed[shown(fullPath)] = val[0];
   }
   lastState = now;
   return changed;
@@ -120,7 +146,7 @@ export function staleFiles(): string[] {
       const currentMtime = fs.statSync(fullPath).mtimeMs;
       if (currentMtime !== mtime && WARNED.get(fullPath) !== currentMtime) {
         WARNED.set(fullPath, currentMtime);
-        stale.push(path.relative(process.cwd(), fullPath) || fullPath);
+        stale.push(shown(fullPath));
       }
     } catch {}
   }
