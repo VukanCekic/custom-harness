@@ -2,6 +2,7 @@ import type { ChatFunctionTool } from "@openrouter/sdk/models";
 import type { Tool } from "./types.js";
 import { bashTool } from "./bash.js";
 import { readFileTool } from "./readFile.js";
+import { readSkillTool } from "./readSkill.js";
 
 /**
  * All active tools available to the LLM agent.
@@ -9,7 +10,8 @@ import { readFileTool } from "./readFile.js";
  */
 export const registeredTools: Tool[] = [
   bashTool,
-  readFileTool
+  readFileTool,
+  readSkillTool
 ];
 
 export const TOOL_SCHEMAS: ChatFunctionTool[] = registeredTools.map((t) => t.schema);
@@ -34,3 +36,4 @@ export async function executeTool(name: string, args: Record<string, any>): Prom
 export * from "./types.js";
 export * from "./bash.js";
 export * from "./readFile.js";
+export * from "./readSkill.js";
