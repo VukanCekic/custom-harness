@@ -10,7 +10,7 @@ async function runSession(promptText: string): Promise<void> {
 
   try {
     const result = await runAgent(promptText, {
-      maxTurns: 15,
+      maxTurns: 50,
       onTurnStart: (turn) => {
         spinner.stop();
         spinner = ui.working(`thinking (turn ${turn})...`);
@@ -74,9 +74,9 @@ async function runSession(promptText: string): Promise<void> {
         final_response: result.finalResponse,
         usage: result.lastUsage
           ? {
-              ...result.lastUsage,
-              cost: result.totalCost
-            }
+            ...result.lastUsage,
+            cost: result.totalCost
+          }
           : null,
         metrics: result.lastMetrics,
         transcript: result.messages

@@ -3,6 +3,7 @@ import type { Tool } from "./types.js";
 import { bashTool } from "./bash.js";
 import { readFileTool } from "./readFile.js";
 import { readSkillTool } from "./readSkill.js";
+import { browserTool } from "./browser.js";
 
 /**
  * All active tools available to the LLM agent.
@@ -11,7 +12,8 @@ import { readSkillTool } from "./readSkill.js";
 export const registeredTools: Tool[] = [
   bashTool,
   readFileTool,
-  readSkillTool
+  readSkillTool,
+  browserTool
 ];
 
 export const TOOL_SCHEMAS: ChatFunctionTool[] = registeredTools.map((t) => t.schema);
@@ -37,3 +39,4 @@ export * from "./types.js";
 export * from "./bash.js";
 export * from "./readFile.js";
 export * from "./readSkill.js";
+export * from "./browser.js";
