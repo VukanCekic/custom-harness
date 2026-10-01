@@ -1,0 +1,1518 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index 2f5ca0e..53e88a4 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -14,7 +14,7 @@ import { TOOL_SCHEMAS, toolsFor } from "./tools/index.js";
+ import { reminder } from "./context.js";
+ import { cap, sweep, settle, fit, estimate } from "./history.js";
+ import { compact } from "./compact.js";
+-import { approver, asker, execute, peek, type Asker } from "./execute.js";
++import { approver, asker, cutOff, execute, peek, type Asker } from "./execute.js";
+ import { blame, observe, type CacheBreak } from "./cache.js";
+ import { CancelledError, within, type Role } from "./scope.js";
+ 
+@@ -34,8 +34,12 @@ export interface AgentOptions {
+   onChunk?: (chunk: string) => void;
+   onCompacted?: (before: number, messages: ChatMessages[]) => void;
+   onNote?: (text: string) => void;
+-  /** Called after every change to the transcript, so a session log can keep up. */
+-  onTranscript?: (messages: ChatMessages[]) => void;
++  /**
++   * Called after every change to the transcript, so a session log can keep up.
++   * `replaced` names a rewrite (compaction) the log must record whole: the
++   * message count alone cannot tell, since one message can replace one.
++   */
++  onTranscript?: (messages: ChatMessages[], replaced?: string) => void;
+   onCacheBreak?: (info: CacheBreak) => void;
+   onModeChange?: (mode: Mode) => void;
+   injectReminder?: boolean;
+@@ -180,15 +184,16 @@ export async function runAgent(
+ 
+       // 1. Compaction first: it summarises what it removes, fit() only loses it.
+       //    Checked before the request, so no call is paid for and then thrown away.
+-      const size = estimate(messages);
+-      if (size + fixed > budget && size - compactedAt > config.contextWindow * 0.25) {
++      let compactedNow = false;
++      const tryCompact = async () => {
++        compactedNow = true;
+         const before = messages.length;
+         try {
+           blame(messages, "compaction");
+           const done = await compact(messages);
+-          if (done.after < before) {
++          if (done.changed) {
+             compactions.push({ step, before, after: done.after, cost: done.cost });
+-            persist();
++            options.onTranscript?.(messages, "compaction");
+             options.onCompacted?.(before, messages);
+           }
+         } catch (err: any) {
+@@ -198,11 +203,21 @@ export async function runAgent(
+           options.onNote?.(`compaction failed (${err.message || String(err)}); continuing without it`);
+         }
+         compactedAt = estimate(messages);
++      };
++      const size = estimate(messages);
++      if (size + fixed > budget && size - compactedAt > config.contextWindow * 0.25) {
++        await tryCompact();
+       }
+ 
+       // 2. Last resort. It refuses an unreachable target rather than dropping
+-      //    every result on the way to failing anyway, so stop loudly instead.
+-      const fitted = fit(messages, budget, fixed);
++      //    every result on the way to failing anyway. Before stopping the turn,
++      //    one compaction the cooldown held back is still better than none.
++      let fitted = fit(messages, budget, fixed);
++      const floorOfPrompt = fixed + estimate([messages[0]]);
++      if (!fitted.fits && !compactedNow && floorOfPrompt <= budget) {
++        await tryCompact();
++        fitted = fit(messages, budget, fixed);
++      }
+       if (fitted.stubbed + fitted.elided + fitted.dropped + fitted.squeezed > 0) {
+         blame(messages, "fit");
+         options.onNote?.(
+@@ -212,9 +227,12 @@ export async function runAgent(
+       }
+       if (!fitted.fits) {
+         throw new ContextBudgetError(
+-          `This request needs ~${fitted.floor} tokens even with every old tool result dropped, but the budget is ` +
+-          `${budget} (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}, ~${fixed} of it tool schemas). ` +
+-          `Raise CONTEXT_WINDOW or run /compact.`
++          floorOfPrompt > budget
++            ? `The tool schemas and system prompt alone need ~${floorOfPrompt} tokens, more than the ${Math.round(budget)}-token ` +
++              `budget (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}). Raise CONTEXT_WINDOW; /compact cannot help.`
++            : `This request needs ~${fitted.floor} tokens even with every old tool result dropped, but the budget is ` +
++              `${Math.round(budget)} (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}; ~${fixed} of it ` +
++              `tool schemas and the reminder reserve). Raise CONTEXT_WINDOW or run /compact.`
+         );
+       }
+ 
+@@ -238,10 +256,11 @@ export async function runAgent(
+       }
+ 
+       // Call the LLM with conversation history (+ late injection) and available tools
+-      const { message, usage, metrics } = await callLLM(messagesToSend, tools.schemas, {
++      const { message, usage, metrics, finishReason } = await callLLM(messagesToSend, tools.schemas, {
+         onChunk: options.onChunk,
+         stable: messages.length
+       });
++      const truncated = finishReason === "length";
+ 
+       lastUsage = usage;
+       lastMetrics = metrics;
+@@ -279,6 +298,10 @@ export async function runAgent(
+ 
+       // If no tool calls were requested, the agent is done
+       if (!message.toolCalls || message.toolCalls.length === 0) {
++        if (truncated) {
++          finalResponse += "\n\n(the answer was cut off: it hit the output-token limit)";
++          options.onNote?.("the answer hit the output-token limit and is incomplete - say \"continue\" for the rest");
++        }
+         if (options.onStepEnd) {
+           options.onStepEnd(step, usage);
+         }
+@@ -309,9 +332,12 @@ export async function runAgent(
+         // In pipeline mode the agent's own bash is read-only: anything that
+         // would need approval is refused, so edits go through the worker.
+         const approve = mode === "pipeline" && toolName === "bash" ? undefined : options.onApprove;
+-        const { args, result } = await approver.run(options.onApprove, () =>
+-          asker.run(options.onAsk, () => execute(toolCall, { tools: tools.byName, approve }))
+-        );
++        const cut = truncated ? cutOff(toolCall) : null;
++        const { args, result } = cut
++          ? { args: {}, result: cut }
++          : await approver.run(options.onApprove, () =>
++              asker.run(options.onAsk, () => execute(toolCall, { tools: tools.byName, approve }))
++            );
+ 
+         // Cap fresh tool result: if oversized, spill to disk and replace with pointer
+         const cappedResult = cap(result);
+diff --git a/src/compact.ts b/src/compact.ts
+index 3aa9101..c2f602d 100644
+--- a/src/compact.ts
++++ b/src/compact.ts
+@@ -208,6 +208,8 @@ export interface Compaction {
+   before: number;
+   after: number;
+   cost: number;
++  /** The transcript was rewritten. Not the same as after < before: one message can replace one. */
++  changed: boolean;
+ }
+ 
+ /**
+@@ -222,9 +224,14 @@ export interface Compaction {
+ export async function compact(messages: ChatMessages[], force = false): Promise<Compaction> {
+   const before = messages.length;
+   const budget = force ? 0 : config.contextWindow * config.compactTo;
+-  const cut = tailStart(messages, budget);
++  // Never cut into the exchange the model has not read yet: summarising those
++  // results hands it a paraphrase of output it asked for and never saw. If
++  // they are too big to keep whole, fit() squeezes them to a pointer instead.
++  const fresh = live(messages);
++  const unreadFrom = fresh < messages.length ? fresh - 1 : messages.length;
++  const cut = Math.min(tailStart(messages, budget), unreadFrom);
+   if (cut <= 1) {
+-    return { before, after: before, cost: 0 }; // nothing old enough to be worth summarising
++    return { before, after: before, cost: 0, changed: false }; // nothing old enough to be worth summarising
+   }
+ 
+   const old = messages.slice(1, cut);
+@@ -252,5 +259,5 @@ export async function compact(messages: ChatMessages[], force = false): Promise<
+ 
+   // In-place update so caller references stay in sync
+   messages.splice(0, messages.length, ...kept);
+-  return { before, after: messages.length, cost };
++  return { before, after: messages.length, cost, changed: true };
+ }
+diff --git a/src/execute.ts b/src/execute.ts
+index 401a4ca..0139b25 100644
+--- a/src/execute.ts
++++ b/src/execute.ts
+@@ -51,6 +51,26 @@ export function peek(raw: string | undefined): Record<string, any> {
+   }
+ }
+ 
++/**
++ * The reply hit the output-token limit, so its last call is cut off. The
++ * generic "not valid JSON - send the complete call again" made the model
++ * resend the same oversized call until the step limit, paying for the output
++ * each time. Returns the result to record instead of running it, or null if
++ * this call arrived whole.
++ */
++export function cutOff(call: ChatToolCall): string | null {
++  try {
++    JSON.parse(call.function.arguments || "{}");
++    return null;
++  } catch {
++    return (
++      `Error: your reply hit the output-token limit and this ${call.function.name} call was cut off, so nothing was run. ` +
++      "Sending it again will be cut off the same way. Make it smaller: write a long file in parts " +
++      "(write_file with the first part, then str_replace to add the rest), or split the work into several calls."
++    );
++  }
++}
++
+ export async function execute(call: ChatToolCall, gate: Gate): Promise<Executed> {
+   const name = call.function.name;
+ 
+@@ -77,7 +97,8 @@ export async function execute(call: ChatToolCall, gate: Gate): Promise<Executed>
+     };
+   }
+ 
+-  const permission = check(name, args);
++  // A caller that cannot ask is read-only: stricter rules, see check().
++  const permission = check(name, args, { strict: !gate.approve });
+   const reason = permission.reason || name;
+   if (permission.action === "deny") {
+     return { args, result: `Permission denied: ${reason} is blocked by security policy.` };
+diff --git a/src/history.ts b/src/history.ts
+index 74be93d..3c9e987 100644
+--- a/src/history.ts
++++ b/src/history.ts
+@@ -44,6 +44,9 @@ export const HANDOFF_OPENING = `${SUMMARY}\nEverything before this point has bee
+ 
+ const DROPPED_NOTE = `${DROPPED} dropped to fit the context window.]`;
+ 
++const STUB_END = /\n\n\[output stripped: \d+ more chars\. Run the command again if you need them\.\]$/;
++const PARKED = /\[output trimmed: \d+ of \d+ chars cut from the middle\. The whole output is at (.+?) - page through it with head, tail, or read_file\./;
++
+ const ELIDE_MIN = 500; // chars - an edit argument shorter than this stays verbatim
+ const ELIDE_ANY = 2_000; // chars - any other string argument longer than this goes
+ 
+@@ -56,11 +59,36 @@ export type SpillScope = string[];
+ /** The main agent's current turn. Subagents bring their own scope. */
+ export const SPILLS: SpillScope = [];
+ 
++/** Every spill file still on disk, whichever run owns it. */
++const LIVE = new Set<string>();
++const spillKey = (filePath: string) => {
++  const resolved = path.resolve(filePath);
++  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
++};
++
++/**
++ * Is this one of the harness's own live spill files? They sit in the OS temp
++ * directory, outside the project, so without this every attempt to page one
++ * needed an approval - and read-only subagents were refused outright.
++ */
++export function isSpill(filePath: string): boolean {
++  return LIVE.has(spillKey(filePath));
++}
++
+ function text(message: ChatMessages): string {
+   const raw = (message as any)?.content;
+   return typeof raw === "string" ? raw : "";
+ }
+ 
++/**
++ * What a result already is, judged by the exact shape strip() and fit() give
++ * it - never by a marker appearing somewhere inside. A result that merely
++ * quotes a marker (reading this file does) used to count as stripped forever,
++ * and fit() priced it as droppable while refusing to drop it.
++ */
++const isStub = (content: string) => STUB_END.test(content);
++const isDropped = (content: string) => content === DROPPED_NOTE;
++
+ // ------------------------------------------------------------------- 1. cap
+ 
+ /**
+@@ -71,6 +99,7 @@ export function spill(text: string, scope: SpillScope = SPILLS): string {
+   const filePath = path.join(os.tmpdir(), fileName);
+   fs.writeFileSync(filePath, text, "utf-8");
+   scope.push(filePath);
++  LIVE.add(spillKey(filePath));
+   return filePath;
+ }
+ 
+@@ -119,6 +148,7 @@ export function cap(
+  */
+ export function sweep(scope: SpillScope = SPILLS): void {
+   for (const filePath of scope) {
++    LIVE.delete(spillKey(filePath));
+     try {
+       fs.rmSync(filePath, { force: true });
+     } catch {
+@@ -185,7 +215,7 @@ export function strip(messages: ChatMessages[], protectLive = false): number {
+   for (let index = locked(messages); index < end; index++) {
+     const message = messages[index] as any;
+     const content = text(message);
+-    if (message.role !== "tool" || content.includes(STRIPPED) || content.includes(DROPPED) || content.length <= stubLimit) {
++    if (message.role !== "tool" || isStub(content) || isDropped(content) || content.length <= stubLimit) {
+       continue;
+     }
+     message.content = stub(content);
+@@ -288,13 +318,27 @@ export function estimate(messages: ChatMessages[]): number {
+ 
+ /** Re-cap an unread result to SQUEEZE chars, reusing its spill file if it has one. */
+ function squeeze(content: string, scope: SpillScope): string {
+-  const parked = content.match(/The whole output is at (.+?) - page through it/)?.[1];
+-  if (parked && fs.existsSync(parked)) {
++  // Only a pointer cap() itself wrote, to a file it still owns - not a path
++  // that happens to appear in the output.
++  const parked = content.match(PARKED)?.[1];
++  if (parked && isSpill(parked) && fs.existsSync(parked)) {
+     return cap(fs.readFileSync(parked, "utf-8"), scope, SQUEEZE, parked);
+   }
+   return cap(content, scope, SQUEEZE);
+ }
+ 
++/** What squeeze() would leave of a message, priced without writing a file. */
++function squeezedSize(message: ChatMessages): number {
++  const content = text(message);
++  const head = Math.floor(SQUEEZE * 0.7);
++  const pointer =
++    `\n\n${TRIMMED} ${content.length} of ${content.length} chars cut from the middle. The whole output is at ` +
++    `${path.join(os.tmpdir(), "customharness-tool-0000000000000-000000.txt")} - page through it with ` +
++    "head, tail, or read_file. It is deleted when this turn ends.]\n\n";
++  const kept = content.slice(0, head) + pointer + content.slice(content.length - (SQUEEZE - head));
++  return estimate([{ ...(message as any), content: kept } as ChatMessages]);
++}
++
+ export interface Fit {
+   tokens: number; // estimated request size afterwards, overhead included
+   floor: number; // the smallest fit() could have made it
+@@ -308,10 +352,11 @@ export interface Fit {
+ /**
+  * Last resort: shrink tool results until the request fits.
+  *
+- * Prices the deepest possible cut before making any. If even that cannot
+- * reach the budget, nothing is touched - throwing every result away on the
+- * way to failing anyway is how past runs went blind - and the caller has to
+- * compact or stop instead. Normally a no-op: cap, strip and compaction do the
++ * Prices the deepest possible cut before making any, and works on a copy
++ * that is committed only if it fits. Either the request fits afterwards or
++ * the transcript is exactly as it was: throwing results away on the way to
++ * failing anyway is how past runs went blind. When it cannot fit, the caller
++ * has to compact or stop. Normally a no-op: cap, strip and compaction do the
+  * real work.
+  */
+ export function fit(
+@@ -321,7 +366,8 @@ export function fit(
+   scope: SpillScope = SPILLS
+ ): Fit {
+   const sizes = messages.map((m) => estimate([m]));
+-  let tokens = overhead + sizes.reduce((sum, n) => sum + n, 0);
++  const total = overhead + sizes.reduce((sum, n) => sum + n, 0);
++  let tokens = total;
+   const result: Fit = { tokens, floor: tokens, fits: tokens <= budget, stubbed: 0, elided: 0, dropped: 0, squeezed: 0 };
+   if (result.fits) {
+     return result;
+@@ -331,72 +377,81 @@ export function fit(
+   const read: number[] = [];
+   const unread: number[] = [];
+   // Tool-call arguments used to be irreducible: one 200k-char write_file
+-  // could put a request out of reach for good.
++  // could put a request out of reach for good. The call whose results are
++  // still unread keeps its reasoning: its tool loop is not over.
+   const slim = new Map<number, ChatMessages>();
+   for (let index = locked(messages); index < messages.length; index++) {
+     if (messages[index].role === "tool") {
+       (index < fresh ? read : unread).push(index);
+     }
+-    const next = slimmed(messages[index]);
++    const next = index === fresh - 1 && fresh < messages.length ? null : slimmed(messages[index]);
+     if (next) slim.set(index, next);
+   }
++  const squeezable = (index: number) => text(messages[index]).length > SQUEEZE + 400;
+ 
++  // The deepest cut, priced by the same rules the passes below follow.
+   const droppedSize = estimate([{ role: "tool", toolCallId: "", content: DROPPED_NOTE } as ChatMessages]);
+-  const squeezedSize = Math.ceil((SQUEEZE + 400) / 4);
+   result.floor =
+-    tokens -
++    total -
+     [...slim].reduce((sum, [i, next]) => sum + Math.max(0, sizes[i] - estimate([next])), 0) -
+-    read.reduce((sum, i) => sum + Math.max(0, sizes[i] - droppedSize), 0) -
+-    unread.reduce((sum, i) => sum + Math.max(0, sizes[i] - squeezedSize), 0);
++    read.reduce((sum, i) => sum + (isDropped(text(messages[i])) ? 0 : Math.max(0, sizes[i] - droppedSize)), 0) -
++    unread.filter(squeezable).reduce((sum, i) => sum + Math.max(0, sizes[i] - squeezedSize(messages[i])), 0);
+   if (result.floor > budget) {
+     return result;
+   }
+ 
+-  const replace = (index: number, content: string) => {
+-    (messages[index] as any).content = content;
+-    const next = estimate([messages[index]]);
+-    tokens += next - sizes[index];
+-    sizes[index] = next;
++  // Entries of the copy are replaced, never edited, so the original is
++  // untouched until the commit below.
++  const work = [...messages];
++  const replace = (index: number, next: ChatMessages) => {
++    work[index] = next;
++    const size = estimate([next]);
++    tokens += size - sizes[index];
++    sizes[index] = size;
+   };
++  const withContent = (index: number, content: string) => ({ ...(work[index] as any), content }) as ChatMessages;
++  const done = { stubbed: 0, elided: 0, dropped: 0, squeezed: 0 };
+ 
+   // 1. stub what the model has already read, oldest first
+   for (const index of read) {
+     if (tokens <= budget) break;
+-    const content = text(messages[index]);
+-    if (content.includes(STRIPPED) || content.includes(DROPPED) || content.length <= STUB) continue;
+-    replace(index, stub(content));
+-    result.stubbed++;
++    const content = text(work[index]);
++    if (isStub(content) || isDropped(content) || content.length <= STUB) continue;
++    replace(index, withContent(index, stub(content)));
++    done.stubbed++;
+   }
+ 
+   // 2. elide the arguments of calls that already ran, oldest first
+   for (const [index, next] of slim) {
+     if (tokens <= budget) break;
+-    messages[index] = next;
+-    const size = estimate([next]);
+-    tokens += size - sizes[index];
+-    sizes[index] = size;
+-    result.elided++;
++    replace(index, next);
++    done.elided++;
+   }
+ 
+   // 3. then drop what the model has read, oldest first
+   for (const index of read) {
+     if (tokens <= budget) break;
+-    if (text(messages[index]).includes(DROPPED)) continue;
+-    replace(index, DROPPED_NOTE);
+-    result.dropped++;
++    if (isDropped(text(work[index]))) continue;
++    replace(index, withContent(index, DROPPED_NOTE));
++    done.dropped++;
+   }
+ 
+   // 4. only then squeeze what it has not read, biggest first - never to
+   //    nothing: the full text stays on disk and the pointer says where
+   for (const index of [...unread].sort((a, b) => sizes[b] - sizes[a])) {
+     if (tokens <= budget) break;
+-    const content = text(messages[index]);
+-    if (content.length <= SQUEEZE + 400) continue;
+-    replace(index, squeeze(content, scope));
+-    result.squeezed++;
++    if (!squeezable(index)) continue;
++    replace(index, withContent(index, squeeze(text(work[index]), scope)));
++    done.squeezed++;
+   }
+ 
+-  result.tokens = tokens;
+-  result.fits = tokens <= budget;
+-  return result;
++  if (tokens > budget) {
++    // The estimate of the floor was a little optimistic. Report the floor
++    // actually reached and leave the transcript alone.
++    return { ...result, floor: tokens };
++  }
++  for (let index = 0; index < work.length; index++) {
++    if (work[index] !== messages[index]) messages[index] = work[index];
++  }
++  return { ...result, ...done, tokens, fits: true };
+ }
+diff --git a/src/index.ts b/src/index.ts
+index 6bc1455..1f9c6dd 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -16,7 +16,7 @@ import { settle, sweep, HANDOFF_OPENING } from "./history.js";
+ import { usesBreakpoints, type Spend } from "./llm.js";
+ import { blame, forget } from "./cache.js";
+ import { CancelledError } from "./scope.js";
+-import { Session, legacyTranscript, listSessions, load, sessionDir } from "./session.js";
++import { Session, legacyTranscript, listSessions, load, resumable, sessionDir } from "./session.js";
+ 
+ const HELP = `Commands:
+     /clear      - Start a new session (history, todos and plans cleared, browser closed)
+@@ -100,6 +100,22 @@ ui.onInterrupt = () => {
+   cancelTurn();
+ };
+ 
++/**
++ * Keep the session log in step. A log that cannot be written (disk full, a
++ * file locked by a virus scanner) must not take the turn down with it.
++ */
++let logBroken = false;
++function record(messages: ChatMessages[], replaced?: string): void {
++  try {
++    if (replaced) session.replace(messages, replaced);
++    else session.sync(messages);
++    logBroken = false;
++  } catch (err: any) {
++    if (!logBroken) ui.note(`session log not updated (${err.message || String(err)}); the turn carries on`);
++    logBroken = true;
++  }
++}
++
+ function freshTranscript(): ChatMessages[] {
+   return [{ role: "system", content: getSystemPrompt(mode) }];
+ }
+@@ -130,7 +146,7 @@ async function runTurn(promptText: string): Promise<void> {
+       messages: sessionMessages,
+       mode,
+       signal: turn.signal,
+-      onTranscript: (messages) => session.sync(messages),
++      onTranscript: record,
+       onChunk: streaming
+         ? (chunk) => {
+             spinner.stop();
+@@ -285,7 +301,7 @@ async function rewind(): Promise<void> {
+ }
+ 
+ async function switchSession(): Promise<void> {
+-  const sessions = listSessions().filter((s) => s.file !== session.file);
++  const sessions = listSessions().filter((s) => s.file !== session.file && s.firstRequest.trim());
+   if (sessions.length === 0) {
+     ui.note("No other sessions for this project.");
+     return;
+@@ -356,10 +372,10 @@ async function command(input: string): Promise<"done" | "exit" | "prompt"> {
+       try {
+         blame(sessionMessages, "compaction");
+         // forced: works on a short transcript too, keeping only the newest exchange verbatim
+-        await compact(sessionMessages, true);
++        const done = await compact(sessionMessages, true);
+         spinner.stop();
+-        if (sessionMessages.length < before) {
+-          session.replace(sessionMessages, "compaction");
++        if (done.changed) {
++          record(sessionMessages, "compaction");
+           ui.compacted(before, sessionMessages);
+         } else {
+           ui.note("Nothing to compact yet.");
+@@ -412,7 +428,7 @@ async function main() {
+   const warning = budgetWarning(sessionMessages[0].content as string);
+   if (warning) ui.note(`warning: ${warning}`);
+ 
+-  const latest = isResume ? listSessions().find((s) => s.messages > 0) : undefined;
++  const latest = isResume ? resumable() : undefined;
+   if (latest) {
+     // continue the old log rather than opening a new one
+     sessionMessages = adopt(load(latest.file).messages);
+diff --git a/src/llm.ts b/src/llm.ts
+index 61255f7..97817c5 100644
+--- a/src/llm.ts
++++ b/src/llm.ts
+@@ -149,6 +149,8 @@ export interface CallLLMResult {
+   message: AssistantMessageResult;
+   usage: DetailedUsage | null;
+   metrics: TimingMetrics;
++  /** "length" means the reply hit the output limit and its last tool call is cut off. */
++  finishReason: string | null;
+ }
+ 
+ export interface CallOptions {
+@@ -162,8 +164,12 @@ export interface CallOptions {
+    * follows (the late reminder) changes every call and must not be cached.
+    */
+   stable?: number;
++  /** "required" makes the model call one of `tools` - e.g. the reviewer's last turn. */
++  toolChoice?: "auto" | "required" | "none";
+ }
+ 
++const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || undefined;
++
+ const EPHEMERAL = { type: "ephemeral" as const };
+ 
+ /** Anthropic caches only up to an explicit breakpoint; other providers cache on their own. */
+@@ -300,7 +306,9 @@ export async function callLLM(
+           messages: request.messages,
+           tools: request.tools,
+           stream: true,
+-          provider: config.provider
++          provider: config.provider,
++          ...(opts.toolChoice && request.tools ? { toolChoice: opts.toolChoice } : {}),
++          ...(MAX_OUTPUT_TOKENS ? { maxTokens: MAX_OUTPUT_TOKENS } : {})
+         }
+       },
+       { ...RETRY, signal: abort }
+@@ -441,6 +449,7 @@ export async function callLLM(
+           : undefined
+     },
+     usage,
+-    metrics
++    metrics,
++    finishReason
+   };
+ }
+diff --git a/src/permissions.ts b/src/permissions.ts
+index e5c4d1b..0b32d31 100644
+--- a/src/permissions.ts
++++ b/src/permissions.ts
+@@ -1,6 +1,7 @@
+ import { insideProject, PROJECT_ROOT, shellKind } from "./sandbox.js";
+ import { browserTarget, parseBrowserArgs } from "./tools/browser.js";
+ import { config } from "./config.js";
++import { isSpill } from "./history.js";
+ 
+ export type PermissionAction = "allow" | "ask" | "deny";
+ 
+@@ -12,7 +13,70 @@ export interface PermissionCheck {
+ }
+ 
+ /** Paths whose contents should never reach the model without a human saying so. */
+-const SECRETS = /(\.ssh|\.aws|\.gnupg|\.netrc|\bid_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[\s/\\"'=])\.env(\.|\b|$))/i;
++const SECRETS =
++  /(\.ssh|\.aws|\.gnupg|\.netrc|\.npmrc|\.pypirc|\.git-credentials|\.docker[\\/]config\.json|\.kube[\\/]config|\bgh[\\/]hosts\.ya?ml|\bid_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[\s/\\"'=<])\.env(\.|\b|$))/i;
++
++/** Names SECRETS protects, to test shell globs against: `cat .en?` is `cat .env`. */
++const SECRET_NAMES = [".env", ".env.local", ".env.production", ".npmrc", ".pypirc", ".netrc", ".git-credentials", "credentials", "id_rsa", "id_ed25519", "id_ecdsa"];
++
++/**
++ * The words of a command as the shell sees them once quotes and escapes are
++ * gone - `.e''nv`, `".env"` and `.e\nv` are all `.env` - and whether each one
++ * still holds an unquoted glob character the shell will expand.
++ */
++function words(command: string, posix: boolean): Array<{ word: string; glob: boolean }> {
++  const escape = posix ? "\\" : "`";
++  const out: Array<{ word: string; glob: boolean }> = [];
++  let word = "";
++  let glob = false;
++  let quote: string | null = null;
++  const flush = () => {
++    if (word) out.push({ word, glob });
++    word = "";
++    glob = false;
++  };
++  for (let index = 0; index < command.length; index++) {
++    const char = command[index];
++    if (quote) {
++      if (char === quote) quote = null;
++      else word += char;
++    } else if (char === escape) {
++      word += command[++index] ?? "";
++    } else if (char === '"' || char === "'") {
++      quote = char;
++    } else if (/[\s;&|<>()]/.test(char)) {
++      flush();
++    } else {
++      if (char === "*" || char === "?" || char === "[") glob = true;
++      word += char;
++    }
++  }
++  flush();
++  return out;
++}
++
++function globMatches(pattern: string, name: string): boolean {
++  const regex = pattern.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
++  try {
++    return new RegExp(`^${regex}$`, "i").test(name);
++  } catch {
++    return true; // an odd bracket expression: assume the worst
++  }
++}
++
++/**
++ * Could this word, once the shell has expanded it, name a credentials file?
++ * Globs follow the shell's rules: a leading dot has to be written out, and a
++ * pattern of nothing but wildcards (`ls *`, `cat src/*`) aims at no file in
++ * particular - asking about those would make every listing need approval.
++ */
++function touchesSecret({ word, glob }: { word: string; glob: boolean }): boolean {
++  if (SECRETS.test(word)) return true;
++  if (!glob) return false;
++  const base = word.split(/[\\/]/).pop() ?? word;
++  if (!/[^*?]/.test(base.replace(/\[[^\]]*\]/g, ""))) return false;
++  return SECRET_NAMES.some((name) => name.startsWith(".") === base.startsWith(".") && globMatches(base, name));
++}
+ 
+ /**
+  * Wildcard matcher supporting * and ?
+@@ -109,6 +173,11 @@ export function effects(command: string, posix = shellKind() === "posix"): strin
+       quote = char;
+     } else if (char === "$" && next === "(") {
+       found.add("runs a command substitution");
++      index++;
++    } else if (!posix && char === "(") {
++      // PowerShell evaluates (...) and @(...) anywhere in a command line:
++      // `Get-Content (Remove-Item -Recurse src)` deletes src.
++      found.add("runs a subexpression");
+     } else if (posix && char === "`") {
+       found.add("runs a command substitution");
+     } else if ((char === "<" || char === ">") && next === "(") {
+@@ -127,7 +196,9 @@ export function effects(command: string, posix = shellKind() === "posix"): strin
+     }
+   }
+ 
+-  if (SECRETS.test(command)) found.add("reads or writes a credentials file");
++  if (SECRETS.test(command) || words(command, posix).some(touchesSecret)) {
++    found.add("reads or writes a credentials file");
++  }
+   return [...found];
+ }
+ 
+@@ -209,19 +280,35 @@ export const BASH_RULES: Array<[string, PermissionAction]> = [
+  * Flags that turn an allow-listed reader into a writer.
+  */
+ const RISKY_FLAGS: RegExp[] = [
+-  /^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/i,
+-  /^git\s+branch\b.*\s(-d|-D|-m|-M|-c|-C|-f|--delete|--move|--copy|--force)\b/,
++  /^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)\b/i,
++  /^git\s+branch\b.*\s(-d|-D|-m|-M|-c|-C|-f|-u|-t|--delete|--move|--copy|--force|--set-upstream-to|--unset-upstream|--track|--edit-description)\b/,
+   /^git\s+(diff|log|show)\b.*\s--output\b/,
+-  /^sort\b.*\s(-o|--output)\b/,
+-  /^tree\b.*\s-o\b/,
++  /^git\s+diff\b.*\s--no-index\b/, // diffs any two files on disk, outside the project too
++  /^sort\b.*\s(-[a-zA-Z]*o|--o)/, // -o FILE, -oFILE, -uo FILE, and GNU's abbreviations --out=, --outp=...
++  /^tree\b.*\s-o/,
++  /^(rg|ripgrep)\b.*\s--pre\b/, // runs COMMAND on every file it searches
++  /^date\b.*\s(-s|--set)\b/,
+   /^(Get-ChildItem|gci|dir|ls)\b.*\benv:/i
+ ];
+ 
++/** `uniq INPUT OUTPUT` writes OUTPUT. */
++function uniqWrites(part: string): boolean {
++  const [command, ...rest] = part.trim().split(/\s+/);
++  return command === "uniq" && rest.filter((arg) => !arg.startsWith("-")).length >= 2;
++}
++
++/**
++ * Allow-listed commands that run the project's own code (conftest.py, test
++ * files). Fine while a human can watch; not for a role that cannot ask, since
++ * write_file needs no approval inside the project and pytest would run it.
++ */
++const RUNS_PROJECT_CODE: RegExp[] = [/^pytest\b/i, /^python3?\s+-m\s+pytest\b/i];
++
+ /**
+  * Rate every part of a compound command; the strictest verdict wins.
+- * Precedence: deny > ask > allow
++ * Precedence: deny > ask > allow. `strict` is for callers that cannot ask.
+  */
+-export function decide(command: string, posix = shellKind() === "posix"): PermissionAction {
++export function decide(command: string, posix = shellKind() === "posix", strict = false): PermissionAction {
+   const verdicts: PermissionAction[] = [];
+ 
+   for (const part of splitCommand(command, posix)) {
+@@ -231,7 +318,11 @@ export function decide(command: string, posix = shellKind() === "posix"): Permis
+         action = rule;
+       }
+     }
+-    if (action === "allow" && RISKY_FLAGS.some((flag) => flag.test(part.trim()))) {
++    const trimmed = part.trim();
++    if (action === "allow" && (RISKY_FLAGS.some((flag) => flag.test(trimmed)) || uniqWrites(trimmed))) {
++      action = "ask";
++    }
++    if (strict && action === "allow" && RUNS_PROJECT_CODE.some((rule) => rule.test(trimmed))) {
+       action = "ask";
+     }
+     verdicts.push(action);
+@@ -297,22 +388,35 @@ function checkBrowser(args: Record<string, any>): PermissionCheck {
+ }
+ 
+ /**
+- * Return (action, reason). Action is allow, ask or deny.
++ * Return (action, reason). Action is allow, ask or deny. `strict` is set for
++ * callers that cannot ask (read-only subagents, pipeline-mode bash).
+  */
+-export function check(name: string, args: Record<string, any>): PermissionCheck {
++export function check(name: string, args: Record<string, any>, options: { strict?: boolean } = {}): PermissionCheck {
+   if (name === "browser") {
+     return checkBrowser(args);
+   }
+ 
+-  if ((name === "grep" || name === "glob") && args.path && !insideProject(String(args.path))) {
+-    return { action: "ask", reason: `${name} outside ${PROJECT_ROOT}: ${args.path}` };
++  // The harness's own temp files, written for this agent to page through.
++  // They live in the OS temp directory, so the outside-the-project rule used
++  // to ask every time - and refuse read-only roles outright.
++  if ((name === "read_file" || name === "grep") && args.path && isSpill(String(args.path))) {
++    return { action: "allow" };
++  }
++
++  if ((name === "grep" || name === "glob") && args.path) {
++    if (!insideProject(String(args.path))) {
++      return { action: "ask", reason: `${name} outside ${PROJECT_ROOT}: ${args.path}` };
++    }
++    if (SECRETS.test(String(args.path))) {
++      return { action: "ask", reason: `${name} on a credentials file: ${args.path}` };
++    }
+   }
+ 
+   if (name === "bash") {
+     const cmd = String(args.command || "");
+     const why = effects(cmd);
+     return {
+-      action: decide(cmd),
++      action: decide(cmd, undefined, options.strict),
+       reason: why.length > 0 ? `run (${why.join(", ")}): ${cmd}` : `run: ${cmd}`
+     };
+   }
+diff --git a/src/sandbox.ts b/src/sandbox.ts
+index 6f2871f..4d8bcc0 100644
+--- a/src/sandbox.ts
++++ b/src/sandbox.ts
+@@ -1,12 +1,9 @@
+ import fs from "node:fs";
+ import os from "node:os";
+ import path from "node:path";
+-import { exec, execSync, spawn } from "node:child_process";
+-import { promisify } from "node:util";
++import { execSync, spawn, type ChildProcess } from "node:child_process";
+ import { current } from "./scope.js";
+ 
+-const execAsync = promisify(exec);
+-
+ const OUTPUT_LIMIT = 10 * 1024 * 1024;
+ 
+ /**
+@@ -162,6 +159,25 @@ export interface RunResult {
+   code: number | null;
+ }
+ 
++/**
++ * Stop a command and everything it started. Killing just the shell left its
++ * children running on Windows - a timed-out `npm test` kept its node workers,
++ * a cancelled dev server kept its port.
++ */
++function killTree(child: ChildProcess): void {
++  if (child.pid == null || child.exitCode != null) return;
++  if (process.platform === "win32") {
++    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
++      .on("error", () => child.kill());
++    return;
++  }
++  try {
++    process.kill(-child.pid, "SIGKILL"); // the process group spawn() gave it
++  } catch {
++    child.kill("SIGKILL");
++  }
++}
++
+ /**
+  * Runs a command within project boundary, sandboxed when the OS lets us.
+  * Rejects (like exec) on a non-zero exit, a timeout, or runaway output.
+@@ -170,53 +186,61 @@ export async function run(command: string, timeout = 60000): Promise<RunResult>
+   const sandboxed = wrap(command);
+   // Ctrl+C or a subagent's time limit kills the command, not just the wait for it.
+   const signal = current().signal;
+-
+-  if (sandboxed) {
+-    return new Promise((resolve, reject) => {
+-      const child = spawn(sandboxed[0], sandboxed.slice(1), {
+-        cwd: PROJECT_ROOT,
+-        timeout,
+-        env: childEnv(),
+-        signal
+-      });
+-
+-      let stdout = "";
+-      let stderr = "";
+-      const collect = (target: "stdout" | "stderr") => (data: Buffer) => {
+-        if (target === "stdout") stdout += data.toString();
+-        else stderr += data.toString();
+-        if (stdout.length + stderr.length > OUTPUT_LIMIT) child.kill();
+-      };
+-      child.stdout.on("data", collect("stdout"));
+-      child.stderr.on("data", collect("stderr"));
+-
+-      child.on("close", (code, signal) => {
+-        if (code === 0) return resolve({ stdout, stderr, code });
+-        reject(Object.assign(new Error(`Command failed with ${signal ? `signal ${signal}` : `exit code ${code}`}`), {
+-          stdout, stderr, code, signal, killed: signal != null
+-        }));
+-      });
+-
+-      child.on("error", (err) => {
+-        reject(err);
+-      });
+-    });
+-  }
+-
+-  // Windows / default execution
+   const shell =
+     process.platform === "win32"
+       ? windowsBash() || "powershell.exe"
+       : process.env.SHELL || "/bin/sh";
+-
+-  const { stdout, stderr } = await execAsync(command, {
+-    cwd: PROJECT_ROOT,
+-    maxBuffer: OUTPUT_LIMIT,
+-    timeout,
+-    shell,
+-    env: childEnv(),
+-    windowsHide: true,
+-    signal
++  const [file, args] = sandboxed ? [sandboxed[0], sandboxed.slice(1)] : [shell, ["-c", command]];
++
++  return new Promise((resolve, reject) => {
++    const child = spawn(file, args, {
++      cwd: PROJECT_ROOT,
++      env: childEnv(),
++      windowsHide: true,
++      detached: process.platform !== "win32" // its own process group, so killTree reaches its children
++    });
++    // Nothing is ever typed into a command: a bare `cat` gets EOF, not a 60s wait.
++    child.stdin?.end();
++
++    let stdout = "";
++    let stderr = "";
++    let stopped: "timeout" | "cancel" | "output" | null = null;
++    const stop = (why: NonNullable<typeof stopped>) => {
++      if (stopped) return;
++      stopped = why;
++      killTree(child);
++    };
++    const timer = setTimeout(() => stop("timeout"), timeout);
++    const onAbort = () => stop("cancel");
++    if (signal?.aborted) onAbort();
++    else signal?.addEventListener("abort", onAbort, { once: true });
++
++    const collect = (target: "stdout" | "stderr") => (data: Buffer) => {
++      if (target === "stdout") stdout += data.toString();
++      else stderr += data.toString();
++      if (stdout.length + stderr.length > OUTPUT_LIMIT) stop("output");
++    };
++    child.stdout?.on("data", collect("stdout"));
++    child.stderr?.on("data", collect("stderr"));
++
++    const settle = () => {
++      clearTimeout(timer);
++      signal?.removeEventListener("abort", onAbort);
++    };
++    child.on("close", (code, killedBy) => {
++      settle();
++      if (stopped === "cancel") {
++        return reject(Object.assign(new Error("cancelled"), { name: "AbortError", stdout, stderr }));
++      }
++      if (code === 0 && !stopped) return resolve({ stdout, stderr, code });
++      const how = stopped ? `${stopped === "timeout" ? "a timeout" : "too much output"}` : killedBy ? `signal ${killedBy}` : `exit code ${code}`;
++      reject(Object.assign(new Error(`Command failed with ${how}`), {
++        stdout, stderr, code, signal: killedBy ?? (stopped ? "SIGTERM" : null), killed: stopped != null || killedBy != null
++      }));
++    });
++    child.on("error", (err) => {
++      settle();
++      reject(err);
++    });
+   });
+-  return { stdout, stderr, code: 0 };
+ }
+diff --git a/src/session.ts b/src/session.ts
+index 1a08fb0..cd72c3d 100644
+--- a/src/session.ts
++++ b/src/session.ts
+@@ -92,6 +92,15 @@ export interface SessionInfo {
+   firstRequest: string;
+ }
+ 
++/**
++ * The session --resume continues: the newest one with a request in it. Every
++ * launch opens a log, so the newest is often just a system prompt from a
++ * start that was quit at once.
++ */
++export function resumable(dir = sessionDir()): SessionInfo | undefined {
++  return listSessions(dir).find((s) => s.firstRequest.trim());
++}
++
+ /** This project's sessions, newest first. */
+ export function listSessions(dir = sessionDir()): SessionInfo[] {
+   if (!fs.existsSync(dir)) return [];
+@@ -165,8 +174,8 @@ export class Session {
+     }
+     for (let index = this.written; index < messages.length; index++) {
+       this.append({ type: "message", message: messages[index] });
++      this.written = index + 1; // a failed write is retried next time, not duplicated
+     }
+-    this.written = messages.length;
+   }
+ 
+   replace(messages: ChatMessages[], reason: string): void {
+diff --git a/src/subagent.ts b/src/subagent.ts
+index 0866259..0ae772a 100644
+--- a/src/subagent.ts
++++ b/src/subagent.ts
+@@ -1,9 +1,9 @@
+ import type { Tool } from "./tools/types.js";
+-import type { ChatFunctionTool, ChatMessages } from "@openrouter/sdk/models";
++import type { ChatFunctionTool, ChatMessages, ChatToolCall } from "@openrouter/sdk/models";
+ import { callLLM, spentSince, tally } from "./llm.js";
+ import { cap, fit, sweep, type SpillScope } from "./history.js";
+-import { approver, execute, type Gate } from "./execute.js";
+-import { current, within, type Role } from "./scope.js";
++import { approver, cutOff, execute, type Gate } from "./execute.js";
++import { CancelledError, current, within, type Role } from "./scope.js";
+ import { shortStatus } from "./git.js";
+ import { ui } from "./ui.js";
+ import { config } from "./config.js";
+@@ -25,6 +25,18 @@ export interface SubagentConfig {
+   timeoutMs?: number;
+ }
+ 
++/** How a run ended. Only "done" means the text is a finished answer. */
++export type SubagentStatus = "done" | "out_of_turns" | "out_of_context" | "cancelled" | "timeout" | "failed";
++
++export interface SubagentOutcome {
++  status: SubagentStatus;
++  /** What the parent gets back: the report, or partial findings plus the state of the tree. */
++  text: string;
++}
++
++const NOT_RUN = "[not run: the report was already submitted]";
++const CANCELLED = "[cancelled before this ran]";
++
+ /**
+  * Universal subagent runner with an isolated context window.
+  *
+@@ -38,8 +50,14 @@ export interface SubagentConfig {
+  *    fitted every turn - its context can overflow too, and nobody compacts it.
+  * 6. It always reports. Out of turns, out of time, cancelled or crashed, the parent gets what it had
+  *    found so far and what the working tree looks like now - never a bare "Tool error".
++ * 7. Cancelled means stopped: once the turn is cancelled or the deadline passes, no further call runs.
+  */
+ export async function runSubagent(subagentConfig: SubagentConfig): Promise<string> {
++  return (await runSubagentDetailed(subagentConfig)).text;
++}
++
++/** runSubagent, plus how the run ended - so a caller never mistakes partial notes for a result. */
++export async function runSubagentDetailed(subagentConfig: SubagentConfig): Promise<SubagentOutcome> {
+   const {
+     role,
+     taskDescription,
+@@ -75,17 +93,63 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+   ui.subagent(`${label}: ${taskDescription.length > 400 ? `${taskDescription.slice(0, 400)}...` : taskDescription}`);
+   let spinner = ui.working(`${label} working...`);
+ 
+-  const loop = async (): Promise<string> => {
++  /** Run one reply's tool calls. True once `finishOn` has run successfully. */
++  const runCalls = async (calls: ChatToolCall[], truncated: boolean): Promise<boolean> => {
++    let finished = false;
++    for (let index = 0; index < calls.length; index++) {
++      const toolCall = calls[index];
++      if (finished) {
++        // the run is over; answer the remaining calls so the transcript stays valid
++        messages.push({ role: "tool", toolCallId: toolCall.id, content: NOT_RUN });
++        continue;
++      }
++      // A worker used to carry on writing files after the user had cancelled.
++      if (signal.aborted) {
++        for (const pending of calls.slice(index)) {
++          messages.push({ role: "tool", toolCallId: pending.id, content: CANCELLED });
++        }
++        throw signal.reason instanceof Error ? signal.reason : new CancelledError();
++      }
++      spinner.stop();
++      spinner = ui.working(`${label}: running ${toolCall.function.name}...`);
++
++      const cut = truncated ? cutOff(toolCall) : null;
++      const { args, result } = cut ? { args: {}, result: cut } : await execute(toolCall, gate);
++      const capped = cap(result, spills);
++
++      spinner.stop();
++      ui.tool(toolCall.function.name, args, capped, true);
++
++      messages.push({
++        role: "tool",
++        toolCallId: toolCall.id,
++        content: capped
++      });
++
++      if (finishOn && toolCall.function.name === finishOn && !/^(Error|Permission denied|Tool error)/.test(result)) {
++        finished = true;
++        report ||= result;
++      }
++    }
++    return finished;
++  };
++
++  const partial = (why: string): string =>
++    report
++      ? `(${why}, before finishing. Partial findings below - narrow the question and ask again.)\n\n${report}`
++      : `(${why} with nothing to report.)`;
++
++  const loop = async (): Promise<SubagentOutcome> => {
+     for (let turn = 1; turn <= maxTurns; turn++) {
+       spinner.stop();
+       spinner = ui.working(`${label} working (turn ${turn}/${maxTurns})...`);
+ 
+       if (!fit(messages, budget, fixed, spills).fits) {
+-        report ||= `(${label} ran out of context window before it could report.)`;
+-        break;
++        // Said as what it is - it used to be reported as "stopped after N turns".
++        return { status: "out_of_context", text: partial(`${label} ran out of context window`) };
+       }
+ 
+-      const { message, usage } = await callLLM(messages, toolSchemas);
++      const { message, usage, finishReason } = await callLLM(messages, toolSchemas);
+ 
+       if (usage) {
+         spinner.stop();
+@@ -109,57 +173,46 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+ 
+       // Subagent finished if no tool calls requested
+       if (!message.toolCalls || message.toolCalls.length === 0) {
+-        return report || `${label} completed with no output.`;
++        return { status: "done", text: report || `${label} completed with no output.` };
+       }
+ 
+-      let finished = false;
+-      for (const toolCall of message.toolCalls) {
+-        if (finished) {
+-          // the run is over; answer the remaining calls so the transcript stays valid
+-          messages.push({ role: "tool", toolCallId: toolCall.id, content: "[not run: the report was already submitted]" });
+-          continue;
+-        }
+-        spinner.stop();
+-        spinner = ui.working(`${label}: running ${toolCall.function.name}...`);
+-
+-        const { args, result } = await execute(toolCall, gate);
+-        const capped = cap(result, spills);
+-
+-        spinner.stop();
+-        ui.tool(toolCall.function.name, args, capped, true);
+-
+-        messages.push({
+-          role: "tool",
+-          toolCallId: toolCall.id,
+-          content: capped
+-        });
+-
+-        if (finishOn && toolCall.function.name === finishOn && !/^(Error|Permission denied|Tool error)/.test(result)) {
+-          finished = true;
+-          report ||= result;
+-        }
++      if (await runCalls(message.toolCalls, finishReason === "length")) {
++        return { status: "done", text: report };
+       }
+-      if (finished) return report;
+     }
+ 
+     // Out of turns. Ask once more, for the report only: the last thing it
+-    // said is usually "let me check one more file", not a finding.
++    // said is usually "let me check one more file", not a finding. A role that
++    // reports through a tool is offered that tool alone and must call it -
++    // told "do not call any tools", the reviewer could never deliver its
++    // verdict, and no verdict counts as changes_requested.
++    const reportTool = finishOn ? toolMap[finishOn]?.schema : undefined;
+     messages.push({
+       role: "user",
+-      content: "You are out of turns. Reply now with your report - what you found, what you changed, what is unfinished. Do not call any tools."
++      content: reportTool
++        ? `You are out of turns. Call ${finishOn} now with what you have found so far. Do not call any other tool.`
++        : "You are out of turns. Reply now with your report - what you found, what you changed, what is unfinished. Do not call any tools."
+     });
+     try {
+       if (fit(messages, budget, fixed, spills).fits) {
+-        const { message } = await callLLM(messages, toolSchemas);
++        const { message } = await callLLM(
++          messages,
++          reportTool ? [reportTool] : toolSchemas,
++          reportTool ? { toolChoice: "required" } : {}
++        );
+         if (message.content) report = message.content;
++        const calls = (message.toolCalls ?? []).filter((c) => c.function.name === finishOn);
++        if (reportTool && calls.length > 0) {
++          messages.push({ role: "assistant", content: message.content || "", toolCalls: calls } as ChatMessages);
++          if (await runCalls(calls, false)) return { status: "done", text: report };
++        }
+       }
+-    } catch {
++    } catch (err) {
++      if (signal.aborted) throw err;
+       // keep the last thing it managed to say
+     }
+ 
+-    return report
+-      ? `(stopped after ${maxTurns} turns, before finishing. Partial findings below - narrow the question and ask again.)\n\n${report}`
+-      : `(stopped after ${maxTurns} turns with nothing to report.)`;
++    return { status: "out_of_turns", text: partial(`stopped after ${maxTurns} turns`) };
+   };
+ 
+   try {
+@@ -167,17 +220,22 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+   } catch (err: any) {
+     // Files the worker already changed stay changed, so the parent needs to
+     // know what the tree looks like now, not just that something went wrong.
+-    const why = parent?.aborted
+-      ? "was cancelled by the user"
+-      : deadline.aborted
+-        ? `ran out of time (${Math.round(timeoutMs / 1000)}s)`
+-        : `failed: ${err?.message || String(err)}`;
+-    const status = await shortStatus();
+-    return [
+-      `(${label} ${why} before finishing.)`,
+-      report ? `Last thing it reported:\n${report}` : "",
+-      `Working tree now (git status --short):\n${status || "(clean, or not a git repository)"}`
+-    ].filter(Boolean).join("\n\n");
++    const status: SubagentStatus = parent?.aborted ? "cancelled" : deadline.aborted ? "timeout" : "failed";
++    const why =
++      status === "cancelled"
++        ? "was cancelled by the user"
++        : status === "timeout"
++          ? `ran out of time (${Math.round(timeoutMs / 1000)}s)`
++          : `failed: ${err?.message || String(err)}`;
++    const tree = await shortStatus();
++    return {
++      status,
++      text: [
++        `(${label} ${why} before finishing.)`,
++        report ? `Last thing it reported:\n${report}` : "",
++        `Working tree now (git status --short):\n${tree || "(clean, or not a git repository)"}`
++      ].filter(Boolean).join("\n\n")
++    };
+   } finally {
+     spinner.stop();
+     sweep(spills);
+diff --git a/src/tools/orchestrator.ts b/src/tools/orchestrator.ts
+index 0da5ebd..86ecaa7 100644
+--- a/src/tools/orchestrator.ts
++++ b/src/tools/orchestrator.ts
+@@ -7,7 +7,7 @@ import { writeFileTool } from "./writeFile.js";
+ import { stringReplaceTool } from "./stringReplace.js";
+ import { readSkillTool } from "./readSkill.js";
+ import { grepTool, globTool } from "./search.js";
+-import { runSubagent } from "../subagent.js";
++import { runSubagent, runSubagentDetailed } from "../subagent.js";
+ import { git, snapshot } from "../git.js";
+ import {
+   artifactsDir,
+@@ -98,7 +98,7 @@ export const planTool: Tool<PlanTaskArgs, string> = {
+   execute: async (args) => {
+     const goal = args.goal || args.description || JSON.stringify(args);
+     const context = args.context ? `\n\nAdditional Context:\n${args.context}` : "";
+-    const report = await runSubagent({
++    const outcome = await runSubagentDetailed({
+       role: "planner",
+       taskDescription: `Create an implementation plan for the following goal:\n${goal}${context}`,
+       systemPrompt: getPlannerPrompt(),
+@@ -107,9 +107,16 @@ export const planTool: Tool<PlanTaskArgs, string> = {
+       label: "planner",
+       readOnly: true
+     });
+-    if (report.startsWith("(planner ")) {
+-      return report; // failed or cancelled - nothing worth storing as a plan
++    if (outcome.status !== "done") {
++      // Partial notes are not a plan. Stored, they became the worker's
++      // instructions ("I was still looking at README.md").
++      return (
++        `The planner did not finish (${outcome.status.replace(/_/g, " ")}), so nothing was saved as a plan. ` +
++        "Call plan_task again with a narrower goal, or ask the user.\n\n" +
++        outcome.text
++      );
+     }
++    const report = outcome.text;
+     const record = savePlan(`# Goal\n${goal}${context}\n\n${report}`);
+     return (
+       `Plan saved as plan_id "${record.id}" (${path.relative(process.cwd(), record.path)}). ` +
+diff --git a/src/tools/readFile.ts b/src/tools/readFile.ts
+index b5ef7a3..00067e5 100644
+--- a/src/tools/readFile.ts
++++ b/src/tools/readFile.ts
+@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
+ import path from "node:path";
+ import type { Tool } from "./types.js";
+ import { noteRead } from "../context.js";
++import { CAP } from "../history.js";
+ 
+ export interface ReadFileArgs {
+   path: string;
+@@ -11,6 +12,7 @@ export interface ReadFileArgs {
+ 
+ const WHOLE_FILE_LIMIT = 2 * 1024 * 1024; // bytes read without offset/limit
+ const PAGED_FILE_LIMIT = 64 * 1024 * 1024; // bytes read at all
++const PAGE_CHARS = Math.floor(CAP * 0.9); // a whole read longer than this comes back as its first page
+ 
+ function numbered(lines: string[], first: number): string {
+   return lines.map((line, i) => `${first + i}\t${line}`).join("\n");
+@@ -84,7 +86,21 @@ export const readFileTool: Tool<ReadFileArgs, string> = {
+         return header + numbered(selected, start);
+       }
+ 
+-      return numbered(lines, 1);
++      // Too long for the tool cap: hand back the first page and say how to go
++      // on. Capped instead, the numbered text was spilled to a temp file, and
++      // paging that with read_file numbered every line a second time.
++      const whole = numbered(lines, 1);
++      if (whole.length <= PAGE_CHARS) return whole;
++      let end = 0;
++      for (let size = 0; end < lines.length && size + lines[end].length + 8 <= PAGE_CHARS; end++) {
++        size += lines[end].length + 8;
++      }
++      end = Math.max(end, 1);
++      return (
++        `[Lines 1 to ${end} of ${lines.length} - too long to show at once. ` +
++        `Continue with offset=${end + 1}, or grep for what you need.]\n` +
++        numbered(lines.slice(0, end), 1)
++      );
+     } catch (err: any) {
+       return `Error reading file "${targetPath}": ${err.message || String(err)}`;
+     }
+diff --git a/tests/helpers/mock.ts b/tests/helpers/mock.ts
+index b0795b3..8e31867 100644
+--- a/tests/helpers/mock.ts
++++ b/tests/helpers/mock.ts
+@@ -21,6 +21,7 @@ export interface MockTurn {
+   omitIndex?: boolean; // some upstreams omit tool_call.index
+   reasoningDetails?: any[]; // streamed as reasoning_details, split across two chunks
+   delayMs?: number; // wait before answering; honours the request's abort signal
++  finishReason?: string; // override the final finish_reason, e.g. "length"
+ }
+ 
+ export type Script = (body: any, callIndex: number) => MockTurn | Promise<MockTurn>;
+@@ -96,7 +97,7 @@ export function install() {
+     const promptTokens = turn.promptTokens ?? Math.ceil(bodyText.length / 4);
+     chunks.push({
+       ...base,
+-      choices: [{ index: 0, delta: {}, finish_reason: turn.toolCalls?.length ? "tool_calls" : "stop" }],
++      choices: [{ index: 0, delta: {}, finish_reason: turn.finishReason ?? (turn.toolCalls?.length ? "tool_calls" : "stop") }],
+       usage: {
+         prompt_tokens: promptTokens,
+         completion_tokens: 50,
+diff --git a/tests/regressions.test.ts b/tests/regressions.test.ts
+new file mode 100644
+index 0000000..ca40bff
+--- /dev/null
++++ b/tests/regressions.test.ts
+@@ -0,0 +1,215 @@
++/**
++ * Regressions found by the second audit (docs/codebase_audit_and_proposals.md).
++ * Each test is named after the finding it pins. The loop tests drive the real
++ * agent against the scripted mock in a throwaway git repository.
++ */
++import { test, beforeEach } from "node:test";
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { execSync } from "node:child_process";
++
++const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "harness-regress-"));
++execSync("git init -q && git config user.email t@t && git config user.name t && git config core.autocrlf false", { cwd: WORK });
++fs.writeFileSync(path.join(WORK, "README.md"), "# demo\n");
++execSync("git add . && git commit -qm init", { cwd: WORK });
++process.chdir(WORK);
++
++process.env.OPENROUTER_API_KEY = "sk-or-mock-never-sent";
++process.env.SESSION_DIR = path.join(WORK, "..", `${path.basename(WORK)}-sessions`);
++process.env.STRIP_AFTER = "0.99";
++delete process.env.MODEL;
++delete process.env.PROVIDER_ONLY;
++
++const mock = await import("./helpers/mock.js");
++mock.install();
++const { runAgent } = await import("../src/agent.js");
++const { compact } = await import("../src/compact.js");
++const history = await import("../src/history.js");
++const { decide, check } = await import("../src/permissions.js");
++const { readFileTool } = await import("../src/tools/readFile.js");
++const { getPlan, resetPipeline } = await import("../src/pipeline.js");
++const { Session, resumable } = await import("../src/session.js");
++const { run } = await import("../src/sandbox.js");
++const { CancelledError } = await import("../src/scope.js");
++
++const tc = (name: string, args: object) => ({ name, arguments: JSON.stringify(args) });
++const sys = (body: any) => String(body.messages?.[0]?.content || "");
++const isRole = (body: any, opening: string) => sys(body).startsWith(opening);
++const PLANNER = "You are a software architect";
++const WORKER = "You are a software engineering worker";
++const REVIEWER = "You are a rigorous code reviewer";
++
++beforeEach(() => {
++  mock.reset();
++  resetPipeline();
++});
++
++test("F-CTX-1: a result that quotes a marker is stripped, and fit() never commits a partial cut", () => {
++  const quoting = `const STRIPPED = "[output stripped:"; const DROPPED = "[output dropped:";\n${"x".repeat(9_000)}`;
++  const call = (id: string) => ({ role: "assistant", content: "", toolCalls: [{ id, type: "function", function: { name: "read_file", arguments: "{}" } }] }) as any;
++  const tool = (id: string, content: string) => ({ role: "tool", toolCallId: id, content }) as any;
++  const turn: any[] = [{ role: "system", content: "s" }, { role: "user", content: "q" }, call("a"), tool("a", quoting), { role: "assistant", content: "ok" }];
++  assert.equal(history.strip(turn), 1, "a file that merely contains the marker strings is still stripped");
++
++  const messages: any[] = [{ role: "system", content: "s" }, { role: "user", content: "q" }, call("a"), tool("a", quoting), call("b"), tool("b", "y".repeat(900))];
++  const before = JSON.stringify(messages);
++  const tooSmall = history.fit(messages, 200);
++  assert.ok(!tooSmall.fits);
++  assert.equal(JSON.stringify(messages), before, "an unreachable budget leaves the transcript exactly as it was");
++  assert.ok(history.fit(messages, 1_500).fits, "and a reachable one is reached by stubbing the quoting result");
++});
++
++test("F-CMP-1: compaction never summarises results the model has not read", async () => {
++  mock.setScript(() => ({ content: "## Goal\nread ten files" }));
++  const calls = Array.from({ length: 10 }, (_, i) => ({ id: `r${i}`, type: "function", function: { name: "read_file", arguments: "{}" } }));
++  const messages: any[] = [
++    { role: "system", content: "s" },
++    { role: "user", content: "Read the ten modules." },
++    { role: "assistant", content: "", toolCalls: calls },
++    ...calls.map((c) => ({ role: "tool", toolCallId: c.id, content: history.cap("export const x = 1;\n".repeat(700)) }))
++  ];
++  const done = await compact(messages);
++  assert.equal(messages.filter((m) => m.role === "tool").length, 10, "all ten unread results are still there");
++  assert.equal(done.changed, true, "the request before them was compacted, though the count did not drop");
++  history.sweep();
++});
++
++test("F-SEC-1: confirmed permission bypasses now ask", () => {
++  for (const cmd of [
++    "rg --pre=rm -e x .",
++    "uniq notes.txt package.json",
++    "sort -opackage.json /dev/null",
++    "sort --out=package.json /dev/null",
++    "find . -fprint0 package.json",
++    "cat <.env",
++    "cat .en?",
++    "head -c 400 .e''nv",
++    "git diff --no-index /dev/null ~/.npmrc",
++    "cat ~/.config/gh/hosts.yml",
++    "git branch -u origin/main"
++  ]) {
++    assert.equal(decide(cmd, true), "ask", cmd);
++  }
++  for (const cmd of ["Get-Content (Remove-Item -Recurse -Force src)", "echo @(Remove-Item -Recurse src)"]) {
++    assert.equal(decide(cmd, false), "ask", `PowerShell: ${cmd}`);
++  }
++  assert.equal(decide("pytest -q", true, true), "ask", "a role that cannot ask may not run project code");
++  assert.equal(decide("pytest -q", true, false), "allow", "with a human in the loop it still flows");
++  assert.equal(check("grep", { pattern: "KEY", path: ".env" }).action, "ask");
++  for (const cmd of ["cat .e*", "cat *rsa", "cat .[e]nv"]) {
++    assert.equal(decide(cmd, true), "ask", `a glob aimed at a credentials file: ${cmd}`);
++  }
++  for (const benign of ["sort -n data.txt", "uniq -c counts.txt", "find . -name '*.ts' -print", "cat package.json", "ls *", "cat src/*", "wc -l *.ts", "grep -n TODO src/*"]) {
++    assert.equal(decide(benign, true), "allow", benign);
++  }
++});
++
++test("F-TOOL-1: spill files can be paged without approval; long files come back paged", async () => {
++  const capped = history.cap("z".repeat(20_000));
++  const spill = capped.match(/The whole output is at (.+?) - page/)![1];
++  assert.equal(check("read_file", { path: spill }).action, "allow", "the harness's own temp file");
++  assert.equal(check("read_file", { path: path.join(os.tmpdir(), "someone-else.txt") }).action, "ask", "any other temp file still asks");
++  history.sweep();
++  assert.equal(check("read_file", { path: spill }).action, "ask", "once swept it is just a path outside the project");
++
++  fs.writeFileSync(path.join(WORK, "long.txt"), Array.from({ length: 2_000 }, (_, i) => `line ${i + 1}`).join("\n"));
++  const page = await readFileTool.execute({ path: "long.txt" });
++  assert.match(page, /^\[Lines 1 to \d+ of 2000 - too long to show at once\. Continue with offset=\d+/);
++  assert.ok(page.length <= history.CAP, "small enough that cap() never spills it, so paging cannot number lines twice");
++});
++
++test("F-SES-1: --resume skips logs that hold only a system prompt", async () => {
++  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "harness-sessions-"));
++  const real = Session.create(dir);
++  real.sync([{ role: "system", content: "s" }, { role: "user", content: "real work" }] as any);
++  await new Promise((r) => setTimeout(r, 20));
++  Session.create(dir).sync([{ role: "system", content: "s" }] as any);
++  assert.equal(resumable(dir)?.file, real.file);
++});
++
++test("F-SUB-1: a planner that runs out of turns does not become a plan", async () => {
++  mock.setScript((body) => {
++    if (isRole(body, PLANNER)) {
++      const forced = String(body.messages.at(-1)?.content).startsWith("You are out of turns");
++      return forced ? { content: "I was still looking at README.md." } : { content: "", toolCalls: [tc("glob", { pattern: "*.md" })] };
++    }
++    return body.messages.at(-2)?.role === "tool" ? { content: "stopping" } : { content: "", toolCalls: [tc("plan_task", { goal: "Add a CHANGELOG" })] };
++  });
++  const result = await runAgent("plan it", { onApprove: async () => true });
++  const report = String(result.messages.find((m: any) => m.role === "tool")?.content);
++  assert.match(report, /^The planner did not finish \(out of turns\), so nothing was saved as a plan/);
++  assert.equal(getPlan(), null);
++});
++
++test("F-SUB-2: a reviewer out of turns can still submit its verdict", async () => {
++  let k = 0;
++  mock.setScript((body) => {
++    if (isRole(body, PLANNER)) return { content: "## Steps\n1. Add CHANGELOG.md" };
++    if (isRole(body, WORKER)) return { content: "Added it" };
++    if (isRole(body, REVIEWER)) {
++      return body.tool_choice === "required"
++        ? { content: "", toolCalls: [tc("submit_review", { verdict: "approved", summary: "Fine." })] }
++        : { content: "", toolCalls: [tc("glob", { pattern: "*.md" })] };
++    }
++    k++;
++    return k === 1 ? { content: "", toolCalls: [tc("plan_task", { goal: "CHANGELOG" })] }
++      : k === 2 ? { content: "", toolCalls: [tc("work_task", {})] }
++        : k === 3 ? { content: "", toolCalls: [tc("review_task", {})] }
++          : { content: "done" };
++  });
++  const result = await runAgent("pipeline", { onApprove: async () => true });
++  const review = result.messages.filter((m: any) => m.role === "tool").map((m: any) => String(m.content))[2];
++  assert.match(review, /^VERDICT: APPROVED/);
++  assert.equal(getPlan()?.reworks, 0, "no rework cycle spent on a missing verdict");
++});
++
++test("F-SUB-3: once the turn is cancelled, a subagent runs none of its remaining calls", async () => {
++  const controller = new AbortController();
++  let k = 0;
++  mock.setScript((body) => {
++    if (isRole(body, PLANNER)) return { content: "Plan: write after.txt" };
++    if (isRole(body, WORKER)) {
++      setTimeout(() => controller.abort(new CancelledError()), 500);
++      return { content: "", toolCalls: [tc("bash", { command: 'node -e "setTimeout(()=>{},3000)"' }), tc("write_file", { path: "after.txt", content: "x" })] };
++    }
++    k++;
++    return k === 1 ? { content: "", toolCalls: [tc("plan_task", { goal: "x" })] } : { content: "", toolCalls: [tc("work_task", {})] };
++  });
++  const result = await runAgent("go", { onApprove: async () => true, signal: controller.signal });
++  assert.equal(result.cancelled, true);
++  assert.ok(!fs.existsSync(path.join(WORK, "after.txt")), "the write queued behind the cancelled command never ran");
++});
++
++test("F-LLM-1: a call cut off by the output limit is reported as such and never run", async () => {
++  let k = 0;
++  mock.setScript(() => {
++    k++;
++    return k === 1
++      ? { content: "", toolCalls: [{ name: "write_file", arguments: '{"path":"big.ts","content":"export const t = [1, 2,' }], finishReason: "length" }
++      : { content: "I will write it in parts." };
++  });
++  const result = await runAgent("write the table", { onApprove: async () => true });
++  const told = String(result.messages.find((m: any) => m.role === "tool")?.content);
++  assert.match(told, /hit the output-token limit/);
++  assert.match(told, /in parts/);
++  assert.ok(!fs.existsSync(path.join(WORK, "big.ts")));
++});
++
++test("F-RUN-1: a timed-out command takes its child processes with it", async () => {
++  const pidFile = path.join(WORK, "child.pid").replace(/\\/g, "/");
++  await assert.rejects(
++    run(`node -e "require('fs').writeFileSync('${pidFile}', String(process.pid)); setTimeout(()=>{}, 20000)" ; true`, 1_500)
++  );
++  await new Promise((r) => setTimeout(r, 500));
++  const pid = Number(fs.readFileSync(pidFile, "utf-8"));
++  let alive = true;
++  try {
++    process.kill(pid, 0);
++  } catch {
++    alive = false;
++  }
++  if (alive) process.kill(pid);
++  assert.equal(alive, false, "the grandchild was killed with the shell");
++});
