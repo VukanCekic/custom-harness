@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": { "correctness": "error" },
+  "rules": {
+    "no-restricted-globals": [
+      "error",
+      {
+        "name": "require",
+        "message": "This is an ES module: require() is undefined here (it silently disabled the Linux sandbox once). Use import."
+      },
+      { "name": "__dirname", "message": "Undefined in an ES module. Use import.meta.url." },
+      { "name": "__filename", "message": "Undefined in an ES module. Use import.meta.url." }
+    ],
+    "no-unused-vars": ["error", { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_", "caughtErrors": "none" }]
+  },
+  "ignorePatterns": ["dist/**", "node_modules/**", "docs/audit/**"]
+}

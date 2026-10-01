@@ -1,0 +1,1756 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index 899782d..cab6b11 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -1,16 +1,17 @@
+-import type { ChatMessages } from "@openrouter/sdk/models";
++import type { ChatFunctionTool, ChatMessages } from "@openrouter/sdk/models";
+ import { config } from "./config.js";
+ import {
+   callLLM,
++  ledger,
+   type AssistantMessageResult,
+   type DetailedUsage,
+   type TimingMetrics
+ } from "./llm.js";
+-import { executeTool, TOOL_SCHEMAS } from "./tools/index.js";
++import { TOOL_SCHEMAS, TOOLS_BY_NAME } from "./tools/index.js";
+ import { reminder } from "./context.js";
+-import { check } from "./permissions.js";
+-import { cap, sweep, strip, fit } from "./history.js";
+-import { needed, compact } from "./compact.js";
++import { cap, sweep, strip, fit, estimate } from "./history.js";
++import { compact } from "./compact.js";
++import { approver, execute, peek } from "./execute.js";
+ 
+ export interface AgentOptions {
+   messages?: ChatMessages[];
+@@ -25,7 +26,9 @@ export interface AgentOptions {
+   onApprove?: (reason: string) => Promise<boolean>;
+   onChunk?: (chunk: string) => void;
+   onCompacted?: (before: number, messages: ChatMessages[]) => void;
++  onNote?: (text: string) => void;
+   injectReminder?: boolean;
++  maxSteps?: number;
+ }
+ 
+ export interface AgentResult {
+@@ -37,6 +40,36 @@ export interface AgentResult {
+   lastMetrics: TimingMetrics | null;
+ }
+ 
++const REMINDER_RESERVE = 300; // tokens kept free for the late-injected <env>/<todos> block
++
++/**
++ * Tokens every request carries that the transcript does not: the tool schemas
++ * and the late reminder. The estimator never sees them, which is why fit() and
++ * compaction used to disagree about whether a request fitted.
++ */
++export function overhead(tools: ChatFunctionTool[] = TOOL_SCHEMAS): number {
++  return Math.ceil(JSON.stringify(tools).length / 4) + REMINDER_RESERVE;
++}
++
++/**
++ * Startup check: is there any room left for the conversation at all?
++ * Returns a warning, or null when the configuration is sane.
++ */
++export function budgetWarning(systemPrompt: string = config.systemPrompt): string | null {
++  const budget = config.contextWindow * config.compactAt;
++  const fixed = overhead() + estimate([{ role: "system", content: systemPrompt }]);
++  if (fixed < budget / 2) return null;
++  return (
++    `CONTEXT_WINDOW=${config.contextWindow} leaves ${Math.max(0, Math.round(budget - fixed))} tokens for the ` +
++    `conversation: tool schemas and the system prompt already take ~${fixed} of the ${budget}-token budget. ` +
++    `Long tool output and compaction will not have room to work.`
++  );
++}
++
++export class ContextBudgetError extends Error {
++  name = "ContextBudgetError";
++}
++
+ /**
+  * Runs the autonomous agent loop.
+  * Continues calling the LLM and executing requested tools in a loop
+@@ -57,8 +90,20 @@ export async function runAgent(
+     messages.push({ role: "user", content: userInput });
+   }
+ 
++  const budget = config.contextWindow * config.compactAt;
++  const fixed = overhead();
++  const maxSteps = options.maxSteps ?? config.maxSteps;
++
++  // Transcript size right after the last compaction. Until it has grown by a
++  // quarter of the window, compacting again would only summarise the summary -
++  // the cascade that lost the user's instructions in past runs.
++  let compactedAt = -Infinity;
++
++  // Everything this turn paid for, read off the ledger: the main loop's calls,
++  // but also compaction and every subagent - which used to go uncounted.
++  const spentBefore = ledger.cost;
++
+   let step = 0;
+-  let totalCost = 0;
+   let lastUsage: DetailedUsage | null = null;
+   let lastMetrics: TimingMetrics | null = null;
+   let finalResponse = "";
+@@ -67,12 +112,50 @@ export async function runAgent(
+     while (true) {
+       step++;
+ 
++      if (step > maxSteps) {
++        finalResponse = `(stopped after ${maxSteps} steps without finishing - say "continue" to carry on.)`;
++        options.onMessage?.(finalResponse);
++        step--;
++        break;
++      }
++
+       if (options.onStepStart) {
+         options.onStepStart(step);
+       }
+ 
+-      // Last resort: drop oldest tool results if budget is still exceeded
+-      fit(messages);
++      // 1. Compaction first: it summarises what it removes, fit() only loses it.
++      //    Checked before the request, so no call is paid for and then thrown away.
++      const size = estimate(messages);
++      if (size + fixed > budget && size - compactedAt > config.contextWindow * 0.25) {
++        const before = messages.length;
++        try {
++          const done = await compact(messages);
++          if (done.after < before && options.onCompacted) {
++            options.onCompacted(before, messages);
++          }
++        } catch (err: any) {
++          // One more API call, fired when the window is nearly full - the worst
++          // moment to lose the turn over a rate limit. fit() still runs below.
++          options.onNote?.(`compaction failed (${err.message || String(err)}); continuing without it`);
++        }
++        compactedAt = estimate(messages);
++      }
++
++      // 2. Last resort. It refuses an unreachable target rather than dropping
++      //    every result on the way to failing anyway, so stop loudly instead.
++      const fitted = fit(messages, budget, fixed);
++      if (fitted.stubbed + fitted.dropped + fitted.squeezed > 0) {
++        options.onNote?.(
++          `shrank tool output to fit: ${fitted.stubbed} stubbed, ${fitted.dropped} dropped, ${fitted.squeezed} squeezed`
++        );
++      }
++      if (!fitted.fits) {
++        throw new ContextBudgetError(
++          `This request needs ~${fitted.floor} tokens even with every old tool result dropped, but the budget is ` +
++          `${budget} (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}, ~${fixed} of it tool schemas). ` +
++          `Raise CONTEXT_WINDOW or run /compact.`
++        );
++      }
+ 
+       // Late injection: a small dynamic block appended just before sending.
+       // Appended to the very end of messages passed to callLLM so the stable prefix
+@@ -96,18 +179,6 @@ export async function runAgent(
+ 
+       lastUsage = usage;
+       lastMetrics = metrics;
+-      if (usage?.cost) {
+-        totalCost += usage.cost;
+-      }
+-
+-      // Check if context window threshold is reached for compaction
+-      if (needed(usage, messages)) {
+-        const beforeCount = messages.length;
+-        await compact(messages);
+-        if (options.onCompacted) {
+-          options.onCompacted(beforeCount, messages);
+-        }
+-      }
+ 
+       // Record the assistant's response in history
+       messages.push({
+@@ -135,48 +206,19 @@ export async function runAgent(
+         break;
+       }
+ 
+-      // Execute each tool call requested by the model
++      // Execute each tool call through the same gate subagents use. The
++      // approver rides along in async context, so a subagent started by one
++      // of these calls asks the same human instead of skipping the question.
+       for (const toolCall of message.toolCalls) {
+         const toolName = toolCall.function.name;
+-        let args: Record<string, any> = {};
+-
+-        try {
+-          args = JSON.parse(toolCall.function.arguments || "{}");
+-        } catch {
+-          // Keep args empty on malformed JSON
+-        }
+ 
+         if (options.onToolCall) {
+-          options.onToolCall(toolName, args);
++          options.onToolCall(toolName, peek(toolCall.function.arguments));
+         }
+ 
+-        // Check permissions / sandbox policy
+-        const permission = check(toolName, args);
+-        let result = "";
+-
+-        if (permission.action === "deny") {
+-          result = `Permission denied: ${permission.reason || toolName} is blocked by security policy.`;
+-        } else if (permission.action === "ask") {
+-          const approved = options.onApprove
+-            ? await options.onApprove(permission.reason || `Execute ${toolName}`)
+-            : false;
+-
+-          if (!approved) {
+-            result = `Permission denied by user for ${permission.reason || toolName}.`;
+-          } else {
+-            try {
+-              result = await executeTool(toolName, args);
+-            } catch (err: any) {
+-              result = `Tool error: ${err.message || String(err)}`;
+-            }
+-          }
+-        } else {
+-          try {
+-            result = await executeTool(toolName, args);
+-          } catch (err: any) {
+-            result = `Tool error: ${err.message || String(err)}`;
+-          }
+-        }
++        const { args, result } = await approver.run(options.onApprove, () =>
++          execute(toolCall, { tools: TOOLS_BY_NAME, approve: options.onApprove })
++        );
+ 
+         // Cap fresh tool result: if oversized, spill to disk and replace with pointer
+         const cappedResult = cap(result);
+@@ -211,7 +253,7 @@ export async function runAgent(
+     finalResponse,
+     messages,
+     steps: step,
+-    totalCost,
++    totalCost: ledger.cost - spentBefore,
+     lastUsage,
+     lastMetrics
+   };
+diff --git a/src/compact.ts b/src/compact.ts
+index 4f72a45..e1753e9 100644
+--- a/src/compact.ts
++++ b/src/compact.ts
+@@ -8,11 +8,15 @@
+  * the codebase that throws information away for good. It runs rarely and cuts
+  * deep - trimming just enough to fit would put us back over the line next turn,
+  * and every trim costs the whole prompt cache.
++ *
++ * One thing is never summarised: what the user actually typed. Requests are
++ * pinned verbatim into the note and carried forward by every later compaction,
++ * so a summary of a summary cannot paraphrase a constraint out of existence.
+  */
+ 
+ import type { ChatMessages } from "@openrouter/sdk/models";
+ import { config } from "./config.js";
+-import { estimate, strip } from "./history.js";
++import { estimate, strip, HANDOFF_OPENING } from "./history.js";
+ import { callLLM } from "./llm.js";
+ 
+ export const SYSTEM_PROMPT = `You are compacting the transcript of a coding session. The session is out of
+@@ -44,31 +48,71 @@ Rules:
+ - Never invent progress. If something was not finished, say it was not.
+ - No preamble and no sign-off. Start at the first heading.`;
+ 
+-export const HANDOFF = `<summary>
+-Everything before this point has been compacted out of the context window to
++export const HANDOFF = `${HANDOFF_OPENING} out of the context window to
+ free up room. This is the record of it - treat it as your own memory of the
+ work so far, not as something the user told you.
+ 
++The user's requests below are quoted exactly and are carried through every
++compaction. Where the notes after them disagree, the requests win.
++{requests}
++
+ {summary}
+ </summary>`;
+ 
++const PIN_EACH = 2_000; // chars kept of one request
++const PIN_TOTAL = 6_000; // chars kept across all of them
++
+ /**
+  * Has the last request grown past the point where we rebuild?
+  */
+ export function needed(
+   usage?: { prompt_tokens?: number } | null,
+-  messages?: ChatMessages[]
++  messages?: ChatMessages[],
++  overhead = 0
+ ): boolean {
+   const threshold = config.contextWindow * config.compactAt;
+   if (usage?.prompt_tokens != null && usage.prompt_tokens > 0) {
+     return usage.prompt_tokens > threshold;
+   }
+   if (messages) {
+-    return estimate(messages) > threshold;
++    return estimate(messages) + overhead > threshold;
+   }
+   return false;
+ }
+ 
++function isHandoff(message: ChatMessages): boolean {
++  return message.role === "user" && typeof message.content === "string" && message.content.startsWith(HANDOFF_OPENING);
++}
++
++/**
++ * The user's own words in `messages`, oldest first, including any already
++ * pinned by an earlier compaction. Always keeps the first (the original task),
++ * then as many of the newest as fit.
++ */
++export function pinned(messages: ChatMessages[]): string[] {
++  const requests: string[] = [];
++  for (const message of messages) {
++    const content = typeof message.content === "string" ? message.content : "";
++    if (isHandoff(message)) {
++      for (const match of content.matchAll(/<request>\n([\s\S]*?)\n<\/request>/g)) requests.push(match[1]);
++    } else if (message.role === "user" && content.trim()) {
++      const quoted = content.replaceAll("</request>", "</ request>");
++      requests.push(quoted.length > PIN_EACH ? `${quoted.slice(0, PIN_EACH)} [...]` : quoted);
++    }
++  }
++  const unique = requests.filter((r, i) => requests.indexOf(r) === i);
++  if (unique.length === 0) return unique;
++
++  const kept = [unique[0]];
++  let total = unique[0].length;
++  const newest: string[] = [];
++  for (let i = unique.length - 1; i > 0 && total + unique[i].length <= PIN_TOTAL; i--) {
++    newest.unshift(unique[i]);
++    total += unique[i].length;
++  }
++  return [...kept, ...newest];
++}
++
+ const ROLES: Record<string, string> = {
+   user: "USER",
+   assistant: "ASSISTANT",
+@@ -76,7 +120,9 @@ const ROLES: Record<string, string> = {
+ };
+ 
+ /**
+- * Flatten the transcript into something the summariser can read.
++ * Flatten the transcript into something the summariser can read. An earlier
++ * handoff note is labelled as one - rendered as USER it reads as the user
++ * speaking, and each generation drifts further from what they actually said.
+  */
+ export function render(messages: ChatMessages[]): string {
+   const lines: string[] = [];
+@@ -98,16 +144,18 @@ export function render(messages: ChatMessages[]): string {
+       content += `\n[called ${fnName}: ${fnArgs}]`;
+     }
+ 
+-    const role = ROLES[message.role] || message.role.toUpperCase();
++    const role = isHandoff(message)
++      ? "EARLIER HANDOFF NOTE"
++      : ROLES[message.role] || message.role.toUpperCase();
+     lines.push(`${role}: ${content}`);
+   }
+   return lines.join("\n\n");
+ }
+ 
+ /**
+- * One LLM call, no tools. Returns the handoff note.
++ * One LLM call, no tools. Returns the handoff note and what it cost.
+  */
+-export async function summarize(messages: ChatMessages[]): Promise<string> {
++export async function summarize(messages: ChatMessages[]): Promise<{ text: string; cost: number }> {
+   const response = await callLLM(
+     [
+       { role: "system", content: SYSTEM_PROMPT },
+@@ -115,7 +163,7 @@ export async function summarize(messages: ChatMessages[]): Promise<string> {
+     ],
+     null
+   );
+-  return response.message.content || "";
++  return { text: response.message.content || "", cost: response.usage?.cost ?? 0 };
+ }
+ 
+ /**
+@@ -155,18 +203,35 @@ export function tailStart(messages: ChatMessages[], budget: number): number {
+   return safeBoundary(messages, 1);
+ }
+ 
++export interface Compaction {
++  before: number;
++  after: number;
++  cost: number;
++}
++
+ /**
+- * system + summary + a recent tail. The caller freezes what comes back.
++ * system + summary + a recent tail, rewritten in place. The caller freezes
++ * what comes back.
+  */
+-export async function compact(messages: ChatMessages[]): Promise<ChatMessages[]> {
++export async function compact(messages: ChatMessages[]): Promise<Compaction> {
++  const before = messages.length;
+   const budget = config.contextWindow * config.compactTo;
+   const cut = tailStart(messages, budget);
+   if (cut <= 1) {
+-    return messages; // nothing old enough to be worth summarising
++    return { before, after: before, cost: 0 }; // nothing old enough to be worth summarising
+   }
+ 
+-  const summary = await summarize(messages.slice(1, cut));
+-  const handoffContent = HANDOFF.replace("{summary}", summary);
++  const old = messages.slice(1, cut);
++  const { text, cost } = await summarize(old);
++  const requests = pinned(old)
++    .map((r) => `<request>\n${r}\n</request>`)
++    .join("\n");
++  // One pass with a replacer function: String.replace expands $$, $& and $'
++  // in a replacement *string*, and summaries of shell sessions are full of
++  // them; a second pass could also rewrite a "{summary}" the user typed.
++  const handoffContent = HANDOFF.replace(/\{(requests|summary)\}/g, (_, key) =>
++    key === "requests" ? requests || "(none)" : text
++  );
+ 
+   const kept: ChatMessages[] = [
+     messages[0],
+@@ -175,11 +240,10 @@ export async function compact(messages: ChatMessages[]): Promise<ChatMessages[]>
+   ];
+ 
+   // Shrink the retained tail now, while we are already paying for a rebuilt
+-  // prefix. Stripping is idempotent, so from here the frozen block is final
+-  // and stays byte-identical - and cached - until the next compaction.
+-  strip(kept);
++  // prefix - but not the newest results, which the model has not read yet.
++  strip(kept, true);
+ 
+   // In-place update so caller references stay in sync
+   messages.splice(0, messages.length, ...kept);
+-  return kept;
++  return { before, after: messages.length, cost };
+ }
+diff --git a/src/config.ts b/src/config.ts
+index 6196d8f..af3b153 100644
+--- a/src/config.ts
++++ b/src/config.ts
+@@ -60,14 +60,17 @@ export const config = {
+   get systemPrompt(): string {
+     return getSystemPrompt();
+   },
+-  provider: {
+-    only: ["together"],
+-    allowFallbacks: false
+-  },
++  // Routing used to be pinned to Together with fallbacks off, so any MODEL
++  // Together does not serve (every Anthropic model, for one) could not run.
++  // PROVIDER_ONLY="together" restores the old behaviour.
++  provider: process.env.PROVIDER_ONLY
++    ? { only: process.env.PROVIDER_ONLY.split(",").map((p) => p.trim()), allowFallbacks: false }
++    : undefined,
+   contextWindow: Number(process.env.CONTEXT_WINDOW) || 64_000,
+   compactAt: Number(process.env.COMPACT_AT) || 0.85,
+   compactTo: Number(process.env.COMPACT_TO) || 0.35,
+   toolCap: Number(process.env.TOOL_CAP) || 10_000,
+   toolStub: Number(process.env.TOOL_STUB) || 300,
+-  subagentMaxTurns: Number(process.env.SUBAGENT_MAX_TURNS) || 15
++  subagentMaxTurns: Number(process.env.SUBAGENT_MAX_TURNS) || 15,
++  maxSteps: Number(process.env.MAX_STEPS) || 60
+ };
+diff --git a/src/execute.ts b/src/execute.ts
+new file mode 100644
+index 0000000..6e98638
+--- /dev/null
++++ b/src/execute.ts
+@@ -0,0 +1,97 @@
++/**
++ * Running one tool call.
++ *
++ * Shared by the main loop and every subagent, so a subagent is fenced in by
++ * exactly the same permission rules - it is a second caller, not a privileged
++ * one, and not a way around any of them.
++ *
++ * A tool call is text the model wrote, so all of it is untrusted: the name may
++ * not exist and the arguments may not be JSON. Each of those comes back as a
++ * result the model can read and retry. None of them is run with whatever
++ * happened to parse, and none of them ends the session.
++ */
++
++import { AsyncLocalStorage } from "node:async_hooks";
++import type { ChatToolCall } from "@openrouter/sdk/models";
++import type { Tool } from "./tools/types.js";
++import { check } from "./permissions.js";
++
++export type Approver = (reason: string) => Promise<boolean>;
++
++/**
++ * The human in the loop for whichever agent is running right now. The main
++ * loop sets it around each tool call, so a subagent started from inside one
++ * inherits it and its risky commands reach the same prompt.
++ */
++export const approver = new AsyncLocalStorage<Approver | undefined>();
++
++export interface Gate {
++  tools: Record<string, Tool>;
++  approve?: Approver; // absent: anything that needs asking is refused
++}
++
++export interface Executed {
++  args: Record<string, any>;
++  result: string;
++}
++
++/** Best-effort parse, for callbacks that only display the arguments. */
++export function peek(raw: string | undefined): Record<string, any> {
++  try {
++    const parsed = JSON.parse(raw || "{}");
++    return parsed && typeof parsed === "object" ? parsed : {};
++  } catch {
++    return {};
++  }
++}
++
++export async function execute(call: ChatToolCall, gate: Gate): Promise<Executed> {
++  const name = call.function.name;
++
++  let args: Record<string, any>;
++  try {
++    args = JSON.parse(call.function.arguments || "{}");
++  } catch (err: any) {
++    // Usually a response cut off mid-call. Running the tool with {} instead
++    // produced errors about "undefined" paths that never told the model why.
++    return {
++      args: {},
++      result: `Error: the arguments for ${name} were not valid JSON (${err.message}). Nothing was run - send the complete call again.`
++    };
++  }
++  if (!args || typeof args !== "object" || Array.isArray(args)) {
++    return { args: {}, result: `Error: the arguments for ${name} must be a JSON object. Nothing was run.` };
++  }
++
++  const tool = gate.tools[name];
++  if (!tool) {
++    return {
++      args,
++      result: `Error: there is no tool named "${name}" here. Available: ${Object.keys(gate.tools).join(", ")}.`
++    };
++  }
++
++  const permission = check(name, args);
++  const reason = permission.reason || name;
++  if (permission.action === "deny") {
++    return { args, result: `Permission denied: ${reason} is blocked by security policy.` };
++  }
++  if (permission.action === "ask") {
++    if (!gate.approve) {
++      return {
++        args,
++        result: `Permission denied: ${reason} needs a human to approve it, and this agent cannot ask. Use a read-only command instead.`
++      };
++    }
++    if (!(await gate.approve(reason))) {
++      return { args, result: `Permission denied by user for ${reason}.` };
++    }
++  }
++
++  try {
++    const raw = await tool.execute(args);
++    return { args, result: typeof raw === "string" ? raw : JSON.stringify(raw, null, 2) };
++  } catch (err: any) {
++    return { args, result: `Tool error: ${err.message || String(err)}` };
++  }
++}
+diff --git a/src/history.ts b/src/history.ts
+index f447f6d..9276d9d 100644
+--- a/src/history.ts
++++ b/src/history.ts
+@@ -9,11 +9,14 @@
+  * 2. strip  - once a turn is over, its tool results shrink to a stub. The edit
+  *             lands at the tail, right before the next user message, so the
+  *             cached prefix in front of it survives.
+- * 3. drop   - a single request is still too big. Throw tool results away whole,
+- *             oldest first, until it fits.
++ * 3. fit    - a single request is still too big. Shrink what the model has
++ *             already read - stub it, then drop it, oldest first - and only then
++ *             squeeze the newest results down to a pointer at their spill file.
++ *             A result the model has not read is never replaced by nothing, and
++ *             when the budget is out of reach fit() changes nothing at all.
+  *
+  * Everything here refuses to touch the locked prefix - the frozen
+- * system + summary + head that compaction leaves behind. That block has to stay
++ * system + summary that compaction leaves behind. That block has to stay
+  * byte-identical to stay cached.
+  */
+ 
+@@ -25,122 +28,172 @@ import { config } from "./config.js";
+ 
+ export const CAP = config.toolCap || 10_000;
+ export const STUB = config.toolStub || 300;
++const SQUEEZE = 1_000; // chars of an unread result kept inline when even that is too much
+ 
+ export const TRIMMED = "[output trimmed:";
+ export const STRIPPED = "[output stripped:";
+ export const DROPPED = "[output dropped:";
+ export const SUMMARY = "<summary>";
+ 
+-export const SPILLS: string[] = [];
++/** Compaction's handoff note always opens with exactly this. */
++export const HANDOFF_OPENING = `${SUMMARY}\nEverything before this point has been compacted`;
++
++const DROPPED_NOTE = `${DROPPED} dropped to fit the context window.]`;
++
++/**
++ * Temp files owned by one agent run. Each run sweeps only its own, so a
++ * subagent finishing cannot delete a file its parent was told to page through.
++ */
++export type SpillScope = string[];
++
++/** The main agent's current turn. Subagents bring their own scope. */
++export const SPILLS: SpillScope = [];
++
++function text(message: ChatMessages): string {
++  const raw = (message as any)?.content;
++  return typeof raw === "string" ? raw : "";
++}
+ 
+ // ------------------------------------------------------------------- 1. cap
+ 
+ /**
+  * Park the full output on disk for the rest of this turn.
+  */
+-export function spill(text: string): string {
+-  const tmpDir = os.tmpdir();
++export function spill(text: string, scope: SpillScope = SPILLS): string {
+   const fileName = `customharness-tool-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`;
+-  const filePath = path.join(tmpDir, fileName);
++  const filePath = path.join(os.tmpdir(), fileName);
+   fs.writeFileSync(filePath, text, "utf-8");
+-  SPILLS.push(filePath);
++  scope.push(filePath);
+   return filePath;
+ }
+ 
++/** Move a cut point off the middle of a surrogate pair. */
++function boundary(text: string, index: number): number {
++  const code = text.charCodeAt(index - 1);
++  return code >= 0xd800 && code <= 0xdbff ? index - 1 : index;
++}
++
+ /**
+  * Trim a fresh tool result, leaving a pointer to the whole thing.
++ *
++ * Keeps the head and the tail: compilers and test runners print the verdict
++ * last, so a head-only cut hides exactly the line the agent needs.
+  */
+-export function cap(text: string): string {
+-  const limit = config.toolCap || 10_000;
++export function cap(
++  text: string,
++  scope: SpillScope = SPILLS,
++  limit: number = config.toolCap || 10_000,
++  parked?: string
++): string {
+   if (text.length <= limit) {
+     return text;
+   }
+ 
++  const headEnd = boundary(text, Math.floor(limit * 0.7));
++  const tailStart = boundary(text, text.length - (limit - headEnd));
++  let pointer: string;
+   try {
+-    const filePath = spill(text);
+-    const cut = text.length - limit;
+-    return (
+-      text.slice(0, limit) +
+-      `\n\n${TRIMMED} ${cut} of ${text.length} chars cut. ` +
++    const filePath = parked ?? spill(text, scope);
++    pointer =
+       `The whole output is at ${filePath} - page through it with ` +
+-      `head, tail, or read_file. It is deleted when this turn ends.]`
+-    );
++      `head, tail, or read_file. It is deleted when this turn ends.`;
+   } catch {
+-    const cut = text.length - limit;
+-    return (
+-      text.slice(0, limit) +
+-      `\n\n${TRIMMED} ${cut} chars cut and the rest could not be saved.]`
+-    );
++    pointer = "The rest could not be saved.";
+   }
++  return (
++    text.slice(0, headEnd) +
++    `\n\n${TRIMMED} ${tailStart - headEnd} of ${text.length} chars cut from the middle. ${pointer}]\n\n` +
++    text.slice(tailStart)
++  );
+ }
+ 
+ /**
+- * Delete this turn's temp files. Their paths die with the tool results.
++ * Delete one run's temp files. Their paths die with the tool results.
+  */
+-export function sweep(): void {
+-  for (const filePath of SPILLS) {
++export function sweep(scope: SpillScope = SPILLS): void {
++  for (const filePath of scope) {
+     try {
+-      if (fs.existsSync(filePath)) {
+-        fs.unlinkSync(filePath);
+-      }
++      fs.rmSync(filePath, { force: true });
+     } catch {
+       // Ignore cleanup error
+     }
+   }
+-  SPILLS.length = 0;
++  scope.length = 0;
+ }
+ 
+ /**
+  * Length of the frozen prefix - everything up to and including the newest
+  * summary. Derived rather than remembered, so it stays correct across
+- * /compact, /rewind and switching sessions.
++ * /compact and --resume.
++ *
++ * Only compaction's own note counts. A C# doc comment or an HTML <details>
++ * block in a tool result contains "<summary>" too, and treating that as the
++ * lock froze every tool result in front of it at full size.
+  */
+ export function locked(messages: ChatMessages[]): number {
+   for (let index = messages.length - 1; index >= 0; index--) {
+-    const raw = (messages[index] as any)?.content;
+-    const content = typeof raw === "string" ? raw : "";
+-    if (content.includes(SUMMARY)) {
++    if (messages[index].role === "user" && text(messages[index]).startsWith(HANDOFF_OPENING)) {
+       return index + 1;
+     }
+   }
+   return 0;
+ }
+ 
++/**
++ * Where the newest step's tool results begin. The model has not read these
++ * yet: replace one with a marker and it re-runs the command, the new result
++ * is dropped too, and the turn never converges.
++ */
++export function live(messages: ChatMessages[]): number {
++  let index = messages.length;
++  while (index > 0 && messages[index - 1].role === "tool") {
++    index--;
++  }
++  return index;
++}
++
+ // ----------------------------------------------------------------- 2. strip
+ 
++function stub(content: string): string {
++  const stubLimit = config.toolStub || 300;
++  return (
++    content.slice(0, stubLimit) +
++    `\n\n${STRIPPED} ${content.length - stubLimit} more chars. ` +
++    `Run the command again if you need them.]`
++  );
++}
++
+ /**
+  * Shrink every tool result that is no longer part of the live turn.
+  *
+  * Called once a turn has finished, so by now "everything unlocked" and
+- * "everything the model no longer needs in full" are the same set.
++ * "everything the model no longer needs in full" are the same set. Mid-turn
++ * callers pass protectLive so the results the model is about to read survive.
+  */
+-export function strip(messages: ChatMessages[]): number {
++export function strip(messages: ChatMessages[], protectLive = false): number {
+   const stubLimit = config.toolStub || 300;
++  const end = protectLive ? live(messages) : messages.length;
+   let shrunk = 0;
+-  const lockIndex = locked(messages);
+ 
+-  for (let index = lockIndex; index < messages.length; index++) {
++  for (let index = locked(messages); index < end; index++) {
+     const message = messages[index] as any;
+-    const raw = message?.content;
+-    const content = typeof raw === "string" ? raw : "";
+-    if (message.role !== "tool" || content.includes(STRIPPED) || content.length <= stubLimit) {
++    const content = text(message);
++    if (message.role !== "tool" || content.includes(STRIPPED) || content.includes(DROPPED) || content.length <= stubLimit) {
+       continue;
+     }
+-
+-    message.content =
+-      content.slice(0, stubLimit) +
+-      `\n\n${STRIPPED} ${content.length - stubLimit} more chars. ` +
+-      `Run the command again if you need them.]`;
++    message.content = stub(content);
+     shrunk++;
+   }
+ 
+   return shrunk;
+ }
+ 
+-// ------------------------------------------------------------------ 3. drop
++// ------------------------------------------------------------------ 3. fit
+ 
+ /**
+- * Rough token count. Good enough to decide whether to panic.
++ * Rough token count. Calibrated against 37 recorded runs: provider-reported
++ * prompt_tokens ~= 0.99 x this + the fixed overhead it does not see (tool
++ * schemas, reminder) - so callers must add that overhead themselves.
+  */
+ export function estimate(messages: ChatMessages[]): number {
+   let totalChars = 0;
+@@ -150,30 +203,100 @@ export function estimate(messages: ChatMessages[]): number {
+   return Math.floor(totalChars / 4);
+ }
+ 
++/** Re-cap an unread result to SQUEEZE chars, reusing its spill file if it has one. */
++function squeeze(content: string, scope: SpillScope): string {
++  const parked = content.match(/The whole output is at (.+?) - page through it/)?.[1];
++  if (parked && fs.existsSync(parked)) {
++    return cap(fs.readFileSync(parked, "utf-8"), scope, SQUEEZE, parked);
++  }
++  return cap(content, scope, SQUEEZE);
++}
++
++export interface Fit {
++  tokens: number; // estimated request size afterwards, overhead included
++  floor: number; // the smallest fit() could have made it
++  fits: boolean;
++  stubbed: number;
++  dropped: number;
++  squeezed: number;
++}
++
+ /**
+- * Last resort: discard whole tool results, oldest first, until it fits.
++ * Last resort: shrink tool results until the request fits.
+  *
+- * Returns how many went. Normally zero - cap and strip do the real work.
++ * Prices the deepest possible cut before making any. If even that cannot
++ * reach the budget, nothing is touched - throwing every result away on the
++ * way to failing anyway is how past runs went blind - and the caller has to
++ * compact or stop instead. Normally a no-op: cap, strip and compaction do the
++ * real work.
+  */
+ export function fit(
+   messages: ChatMessages[],
+-  budget: number = config.contextWindow * config.compactAt
+-): number {
+-  let dropped = 0;
+-  const lockIndex = locked(messages);
+-
+-  for (let index = lockIndex; index < messages.length; index++) {
+-    if (estimate(messages) <= budget) {
+-      break;
+-    }
+-    const message = messages[index] as any;
+-    const raw = message?.content;
+-    const content = typeof raw === "string" ? raw : "";
+-    if (message.role === "tool" && !content.includes(DROPPED)) {
+-      message.content = `${DROPPED} dropped to fit the context window.]`;
+-      dropped++;
++  budget: number = config.contextWindow * config.compactAt,
++  overhead = 0,
++  scope: SpillScope = SPILLS
++): Fit {
++  const sizes = messages.map((m) => estimate([m]));
++  let tokens = overhead + sizes.reduce((sum, n) => sum + n, 0);
++  const result: Fit = { tokens, floor: tokens, fits: tokens <= budget, stubbed: 0, dropped: 0, squeezed: 0 };
++  if (result.fits) {
++    return result;
++  }
++
++  const fresh = live(messages);
++  const read: number[] = [];
++  const unread: number[] = [];
++  for (let index = locked(messages); index < messages.length; index++) {
++    if (messages[index].role === "tool") {
++      (index < fresh ? read : unread).push(index);
+     }
+   }
+ 
+-  return dropped;
++  const droppedSize = estimate([{ role: "tool", toolCallId: "", content: DROPPED_NOTE } as ChatMessages]);
++  const squeezedSize = Math.ceil((SQUEEZE + 400) / 4);
++  result.floor =
++    tokens -
++    read.reduce((sum, i) => sum + Math.max(0, sizes[i] - droppedSize), 0) -
++    unread.reduce((sum, i) => sum + Math.max(0, sizes[i] - squeezedSize), 0);
++  if (result.floor > budget) {
++    return result;
++  }
++
++  const replace = (index: number, content: string) => {
++    (messages[index] as any).content = content;
++    const next = estimate([messages[index]]);
++    tokens += next - sizes[index];
++    sizes[index] = next;
++  };
++
++  // 1. stub what the model has already read, oldest first
++  for (const index of read) {
++    if (tokens <= budget) break;
++    const content = text(messages[index]);
++    if (content.includes(STRIPPED) || content.includes(DROPPED) || content.length <= STUB) continue;
++    replace(index, stub(content));
++    result.stubbed++;
++  }
++
++  // 2. then drop it, oldest first
++  for (const index of read) {
++    if (tokens <= budget) break;
++    if (text(messages[index]).includes(DROPPED)) continue;
++    replace(index, DROPPED_NOTE);
++    result.dropped++;
++  }
++
++  // 3. only then squeeze what it has not read, biggest first - never to
++  //    nothing: the full text stays on disk and the pointer says where
++  for (const index of [...unread].sort((a, b) => sizes[b] - sizes[a])) {
++    if (tokens <= budget) break;
++    const content = text(messages[index]);
++    if (content.length <= SQUEEZE + 400) continue;
++    replace(index, squeeze(content, scope));
++    result.squeezed++;
++  }
++
++  result.tokens = tokens;
++  result.fits = tokens <= budget;
++  return result;
+ }
+diff --git a/src/llm.ts b/src/llm.ts
+index 4fafe5d..b9f34e4 100644
+--- a/src/llm.ts
++++ b/src/llm.ts
+@@ -11,6 +11,26 @@ const openrouter = new OpenRouter({
+   apiKey: config.apiKey
+ });
+ 
++// The SDK default retries 5XX only - for up to an hour, with no request
++// timeout - and never retries 429. Bounded, and rate limits included; the SDK
++// honours Retry-After on its own.
++const RETRY_BUDGET_MS = 180_000;
++const RETRY = {
++  retries: {
++    strategy: "backoff" as const,
++    backoff: { initialInterval: 1_000, maxInterval: 30_000, exponent: 2, maxElapsedTime: RETRY_BUDGET_MS },
++    retryConnectionErrors: true
++  },
++  retryCodes: ["429", "5XX"]
++};
++
++// No data for this long means the stream is dead, not slow. Passing our own
++// signal switches off the SDK's per-attempt timeout, so this is the only one.
++const STALL_MS = Number(process.env.STALL_MS) || 90_000;
++
++/** Every call this process made - main loop, subagents and compaction alike. */
++export const ledger = { calls: 0, cost: 0, promptTokens: 0, cachedTokens: 0 };
++
+ export interface TimingMetrics {
+   generation_tokens_per_second: number | null;
+   e2e_tokens_per_second: number | null;
+@@ -90,26 +110,48 @@ export async function callLLM(
+   let lastTokenTime: number | null = null;
+   let fullContent = "";
+   let rawUsage: ChatUsage | undefined;
++  let finishReason: string | null = null;
+   const accumulatedToolCalls: Map<
+     number,
+     { id: string; name: string; arguments: string }
+   > = new Map();
+ 
+-  const stream = await openrouter.chat.send({
+-    chatRequest: {
+-      model: config.model,
+-      messages,
+-      tools: tools ?? undefined,
+-      stream: true,
+-      provider: config.provider
+-    }
+-  });
++  const watchdog = new AbortController();
++  let stall: NodeJS.Timeout | undefined;
++  const arm = (ms: number) => {
++    clearTimeout(stall);
++    stall = setTimeout(() => watchdog.abort(new Error(`no data from the provider for ${ms}ms`)), ms);
++    stall.unref();
++  };
++  arm(RETRY_BUDGET_MS + STALL_MS); // connecting, retries included
++
++  const stream = await openrouter.chat.send(
++    {
++      chatRequest: {
++        model: config.model,
++        messages,
++        tools: tools ?? undefined,
++        stream: true,
++        provider: config.provider
++      }
++    },
++    { ...RETRY, signal: watchdog.signal }
++  );
+ 
+   if (!(Symbol.asyncIterator in stream)) {
+     throw new Error("Expected a stream response from OpenRouter.");
+   }
+ 
+   for await (const chunk of stream) {
++    arm(STALL_MS);
++
++    // A provider that dies mid-answer says so in-band. Ignoring it handed a
++    // half-written answer back as if it were complete.
++    if (chunk.error) {
++      throw new Error(`Provider error mid-stream (${chunk.error.code}): ${chunk.error.message}`);
++    }
++    finishReason = chunk.choices[0]?.finishReason ?? finishReason;
++
+     const delta = chunk.choices[0]?.delta;
+     const hasToken = Boolean(
+       delta?.content || delta?.reasoning || (delta?.toolCalls && delta.toolCalls.length > 0)
+@@ -139,7 +181,8 @@ export async function callLLM(
+           arguments: ""
+         };
+         if (tc.id) existing.id = tc.id;
+-        if (tc.function?.name) existing.name += tc.function.name;
++        // Some upstreams resend the whole name in every delta ("bashbashbash").
++        if (tc.function?.name && tc.function.name !== existing.name) existing.name += tc.function.name;
+         if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+         accumulatedToolCalls.set(index, existing);
+       }
+@@ -149,6 +192,11 @@ export async function callLLM(
+       rawUsage = chunk.usage;
+     }
+   }
++  clearTimeout(stall);
++
++  if (finishReason === "error") {
++    throw new Error("The provider ended the stream with finish_reason=error.");
++  }
+ 
+   const streamEndTime = performance.now();
+ 
+@@ -200,6 +248,10 @@ export async function callLLM(
+       : undefined;
+ 
+   const usage = extractUsage(rawUsage, metrics);
++  ledger.calls++;
++  ledger.cost += usage?.cost ?? 0;
++  ledger.promptTokens += usage?.prompt_tokens ?? 0;
++  ledger.cachedTokens += usage?.cached_tokens ?? 0;
+ 
+   return {
+     message: {
+diff --git a/src/permissions.ts b/src/permissions.ts
+index ce33d71..91ad774 100644
+--- a/src/permissions.ts
++++ b/src/permissions.ts
+@@ -1,4 +1,4 @@
+-import { insideProject, PROJECT_ROOT } from "./sandbox.js";
++import { insideProject, PROJECT_ROOT, shellKind } from "./sandbox.js";
+ 
+ export type PermissionAction = "allow" | "ask" | "deny";
+ 
+@@ -7,6 +7,9 @@ export interface PermissionCheck {
+   reason?: string;
+ }
+ 
++/** Paths whose contents should never reach the model without a human saying so. */
++const SECRETS = /(\.ssh|\.aws|\.gnupg|\.netrc|\bid_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[\s\/\\"'=])\.env(\.|\b|$))/i;
++
+ /**
+  * Wildcard matcher supporting * and ?
+  */
+@@ -24,9 +27,12 @@ export function matchPattern(text: string, pattern: string): boolean {
+ 
+ /**
+  * Split a compound command on the separators that actually separate.
+- * Anything quoted or backslash-escaped is an argument, not a separator.
++ * Anything quoted or escaped is an argument, not a separator. The escape
++ * character depends on the shell: PowerShell's is the backtick, and treating
++ * "\" as one there let `dir .\;Remove-Item ...` through as a single "dir".
+  */
+-export function splitCommand(command: string): string[] {
++export function splitCommand(command: string, posix = shellKind() === "posix"): string[] {
++  const escape = posix ? "\\" : "`";
+   const parts: string[] = [];
+   let current: string[] = [];
+   let quote: string | null = null;
+@@ -39,7 +45,7 @@ export function splitCommand(command: string): string[] {
+       if (char === quote) {
+         quote = null;
+       }
+-    } else if (char === "\\") {
++    } else if (char === escape) {
+       current.push(char);
+       index++;
+       if (index < command.length) {
+@@ -48,6 +54,10 @@ export function splitCommand(command: string): string[] {
+     } else if (char === '"' || char === "'") {
+       quote = char;
+       current.push(char);
++    } else if (char === "&" && (command[index - 1] === ">" || command[index - 1] === "<" || command[index + 1] === ">")) {
++      // part of a redirection (2>&1, &>file), not a separator - splitting here
++      // left a bare "1" that matched no rule, so every 2>&1 asked for approval
++      current.push(char);
+     } else if (char === "&" || char === "|" || char === ";") {
+       parts.push(current.join(""));
+       current = [];
+@@ -67,6 +77,56 @@ export function splitCommand(command: string): string[] {
+   return parts.map((p) => p.trim()).filter(Boolean);
+ }
+ 
++/**
++ * Shell syntax that writes a file or runs another command from inside what
++ * looks like one harmless argument. A rule like "echo *" cannot see past any
++ * of it, so each one escalates the whole command to ask.
++ */
++export function effects(command: string, posix = shellKind() === "posix"): string[] {
++  const found = new Set<string>();
++  const escape = posix ? "\\" : "`";
++  let quote: string | null = null;
++
++  for (let index = 0; index < command.length; index++) {
++    const char = command[index];
++    const next = command[index + 1] ?? "";
++    if (char === escape && quote !== "'") {
++      index++;
++      continue;
++    }
++    if (quote) {
++      if (char === quote) quote = null;
++      // Double quotes do not stop substitution in bash or PowerShell.
++      else if (quote === '"' && char === "$" && next === "(") found.add("runs a command substitution");
++      else if (quote === '"' && posix && char === "`") found.add("runs a command substitution");
++      continue;
++    }
++    if (char === '"' || char === "'") {
++      quote = char;
++    } else if (char === "$" && next === "(") {
++      found.add("runs a command substitution");
++    } else if (posix && char === "`") {
++      found.add("runs a command substitution");
++    } else if ((char === "<" || char === ">") && next === "(") {
++      found.add("runs a process substitution");
++    } else if (char === "\n" || char === "\r") {
++      found.add("spans several lines");
++    } else if (char === ">") {
++      let at = index + 1;
++      if (command[at] === ">") at++;
++      if (command[at] === "&") continue; // 2>&1
++      while (command[at] === " ") at++;
++      const target = command.slice(at).match(/^[^\s;&|]+/)?.[0] ?? "";
++      if (!/^(\/dev\/null|\$null|nul)$/i.test(target)) {
++        found.add(`writes to ${target || "a file"}`);
++      }
++    }
++  }
++
++  if (SECRETS.test(command)) found.add("reads or writes a credentials file");
++  return [...found];
++}
++
+ /**
+  * Rules for bash commands.
+  * Last matching rule wins, so the catch-all '*' is first.
+@@ -86,7 +146,7 @@ export const BASH_RULES: Array<[string, PermissionAction]> = [
+   ["basename *", "allow"],
+   ["dirname *", "allow"],
+   ["date*", "allow"],
+-  ["env", "allow"],
++  // "env" is gone: it printed every variable, the API key included.
+   ["cat *", "allow"],
+   ["head *", "allow"],
+   ["tail *", "allow"],
+@@ -137,23 +197,40 @@ export const BASH_RULES: Array<[string, PermissionAction]> = [
+   ["Clear-Disk*", "ask"]
+ ];
+ 
++/**
++ * Flags that turn an allow-listed reader into a writer.
++ */
++const RISKY_FLAGS: RegExp[] = [
++  /^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/i,
++  /^git\s+branch\b.*\s(-d|-D|-m|-M|-c|-C|-f|--delete|--move|--copy|--force)\b/,
++  /^git\s+(diff|log|show)\b.*\s--output\b/,
++  /^sort\b.*\s(-o|--output)\b/,
++  /^tree\b.*\s-o\b/,
++  /^(Get-ChildItem|gci|dir|ls)\b.*\benv:/i
++];
++
+ /**
+  * Rate every part of a compound command; the strictest verdict wins.
+  * Precedence: deny > ask > allow
+  */
+-export function decide(command: string): PermissionAction {
+-  const parts = splitCommand(command);
++export function decide(command: string, posix = shellKind() === "posix"): PermissionAction {
+   const verdicts: PermissionAction[] = [];
+ 
+-  for (const part of parts) {
++  for (const part of splitCommand(command, posix)) {
+     let action: PermissionAction = "ask";
+     for (const [pattern, rule] of BASH_RULES) {
+       if (matchPattern(part, pattern)) {
+         action = rule;
+       }
+     }
++    if (action === "allow" && RISKY_FLAGS.some((flag) => flag.test(part.trim()))) {
++      action = "ask";
++    }
+     verdicts.push(action);
+   }
++  if (effects(command, posix).length > 0) {
++    verdicts.push("ask");
++  }
+ 
+   for (const strictest of ["deny", "ask"] as const) {
+     if (verdicts.includes(strictest)) {
+@@ -168,10 +245,11 @@ export function decide(command: string): PermissionAction {
+  */
+ export function check(name: string, args: Record<string, any>): PermissionCheck {
+   if (name === "bash") {
+-    const cmd = args.command || "";
++    const cmd = String(args.command || "");
++    const why = effects(cmd);
+     return {
+       action: decide(cmd),
+-      reason: `run: ${cmd}`
++      reason: why.length > 0 ? `run (${why.join(", ")}): ${cmd}` : `run: ${cmd}`
+     };
+   }
+ 
+@@ -188,6 +266,9 @@ export function check(name: string, args: Record<string, any>): PermissionCheck
+         reason: `${name} outside ${PROJECT_ROOT}: ${args.path}`
+       };
+     }
++    if (SECRETS.test(String(args.path))) {
++      return { action: "ask", reason: `${name} on a credentials file: ${args.path}` };
++    }
+   }
+ 
+   return { action: "allow" };
+diff --git a/src/sandbox.ts b/src/sandbox.ts
+index 8306e35..14af1d7 100644
+--- a/src/sandbox.ts
++++ b/src/sandbox.ts
+@@ -1,35 +1,80 @@
+ import fs from "node:fs";
++import os from "node:os";
+ import path from "node:path";
+-import { exec, spawn } from "node:child_process";
++import { exec, execSync, spawn } from "node:child_process";
+ import { promisify } from "node:util";
+ 
+ const execAsync = promisify(exec);
+ 
+-export const PROJECT_ROOT = path.resolve(process.cwd());
++const OUTPUT_LIMIT = 10 * 1024 * 1024;
+ 
++/**
++ * Resolve symlinks and junctions on the deepest part of the path that exists.
++ * A lexical path.resolve let `link/evil.txt` pass as "inside the project"
++ * while `link` pointed somewhere else entirely.
++ */
++function real(target: string, base = process.cwd()): string {
++  let current = path.resolve(base, target);
++  const rest: string[] = [];
++  while (!fs.existsSync(current)) {
++    const parent = path.dirname(current);
++    if (parent === current) break;
++    rest.unshift(path.basename(current));
++    current = parent;
++  }
++  try {
++    current = fs.realpathSync.native(current);
++  } catch {
++    // keep the lexical path
++  }
++  return path.join(current, ...rest);
++}
++
++export const PROJECT_ROOT = real(process.cwd());
++
++// /dev/null is on the list because almost every command a model writes ends
++// in 2>/dev/null, and a profile without it fails all of them.
+ const PROFILE = `(version 1)
+ (deny default)
+ (allow process-exec process-fork signal)
+ (allow file-read*)
+ (allow sysctl-read)
+ (deny network*)
+-(allow file-write* (subpath "${PROJECT_ROOT}"))
++(allow file-write* (subpath "${PROJECT_ROOT}") (literal "/dev/null"))
+ (deny file-write* (subpath "${path.join(PROJECT_ROOT, ".git")}"))
+ `;
+ 
+ /**
+  * Check if bubblewrap is available on Linux.
++ *
++ * This used to call require() - which does not exist in an ES module. The
++ * ReferenceError landed in the catch below, so bwrap was never found and every
++ * command ran unsandboxed while nothing said so.
+  */
+ function hasBwrap(): boolean {
+   try {
+-    const { execSync } = require("node:child_process");
+-    execSync("which bwrap", { stdio: "ignore" });
++    execSync("command -v bwrap", { stdio: "ignore" });
+     return true;
+   } catch {
+     return false;
+   }
+ }
+ 
++/** Git for Windows' bash, if installed. The tool is called bash, and the model writes bash. */
++function windowsBash(): string | null {
++  const candidates = [
++    process.env.BASH_PATH,
++    "C:\\Program Files\\Git\\bin\\bash.exe",
++    "C:\\Program Files (x86)\\Git\\bin\\bash.exe"
++  ];
++  return candidates.find((p) => p && fs.existsSync(p)) || null;
++}
++
++/** Which syntax the bash tool really speaks - permissions parse commands accordingly. */
++export function shellKind(): "posix" | "powershell" {
++  return process.platform === "win32" && !windowsBash() ? "powershell" : "posix";
++}
++
+ /**
+  * Returns the name of the sandbox enforcement mechanism.
+  */
+@@ -43,9 +88,7 @@ export function name(): string {
+   if (process.platform === "linux" && hasBwrap()) {
+     return "bubblewrap";
+   }
+-  if (process.platform === "win32") {
+-    return "windows";
+-  }
++  // Windows has no OS sandbox here. Reporting "windows" implied one.
+   return "none";
+ }
+ 
+@@ -54,14 +97,13 @@ export function name(): string {
+  */
+ export function insideProject(targetPath: string): boolean {
+   try {
+-    const resolved = path.resolve(PROJECT_ROOT, targetPath);
++    const resolved = real(targetPath, PROJECT_ROOT);
+     const relative = path.relative(PROJECT_ROOT, resolved);
+-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
++    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+       return false;
+     }
+     // Block access to .git
+-    const gitDir = path.join(PROJECT_ROOT, ".git");
+-    const relGit = path.relative(gitDir, resolved);
++    const relGit = path.relative(path.join(PROJECT_ROOT, ".git"), resolved);
+     if (!relGit.startsWith("..") && !path.isAbsolute(relGit)) {
+       return false;
+     }
+@@ -76,17 +118,20 @@ export function insideProject(targetPath: string): boolean {
+  */
+ export function wrap(command: string): string[] | null {
+   if (process.platform === "darwin") {
+-    const os = require("node:os");
+     const profilePath = path.join(os.tmpdir(), "neuralcode.sb");
+     fs.writeFileSync(profilePath, PROFILE, "utf-8");
+     return ["sandbox-exec", "-f", profilePath, "/bin/sh", "-c", command];
+   }
+ 
+   if (process.platform === "linux" && hasBwrap()) {
++    // Same policy as the macOS profile: the project is writable, its .git is not.
++    const gitDir = path.join(PROJECT_ROOT, ".git");
++    const protectGit = fs.existsSync(gitDir) ? ["--ro-bind", gitDir, gitDir] : [];
+     return [
+       "bwrap",
+       "--ro-bind", "/", "/",
+       "--bind", PROJECT_ROOT, PROJECT_ROOT,
++      ...protectGit,
+       "--dev", "/dev",
+       "--proc", "/proc",
+       "--unshare-net",
+@@ -98,34 +143,54 @@ export function wrap(command: string): string[] | null {
+   return null;
+ }
+ 
++/**
++ * The child gets our environment minus the harness's own credentials:
++ * dotenv puts the API key in process.env, and `env` would print it.
++ */
++function childEnv(): NodeJS.ProcessEnv {
++  const env = { ...process.env };
++  for (const key of ["OPENROUTER_API_KEY", ...(process.env.SCRUB_ENV || "").split(",")]) {
++    if (key.trim()) delete env[key.trim()];
++  }
++  return env;
++}
++
++export interface RunResult {
++  stdout: string;
++  stderr: string;
++  code: number | null;
++}
++
+ /**
+  * Runs a command within project boundary, sandboxed when the OS lets us.
++ * Rejects (like exec) on a non-zero exit, a timeout, or runaway output.
+  */
+-export async function run(
+-  command: string,
+-  timeout = 60000
+-): Promise<{ stdout: string; stderr: string }> {
++export async function run(command: string, timeout = 60000): Promise<RunResult> {
+   const sandboxed = wrap(command);
+ 
+   if (sandboxed) {
+     return new Promise((resolve, reject) => {
+       const child = spawn(sandboxed[0], sandboxed.slice(1), {
+         cwd: PROJECT_ROOT,
+-        timeout
++        timeout,
++        env: childEnv()
+       });
+ 
+       let stdout = "";
+       let stderr = "";
+-
+-      child.stdout.on("data", (data) => {
+-        stdout += data.toString();
+-      });
+-      child.stderr.on("data", (data) => {
+-        stderr += data.toString();
+-      });
+-
+-      child.on("close", () => {
+-        resolve({ stdout, stderr });
++      const collect = (target: "stdout" | "stderr") => (data: Buffer) => {
++        if (target === "stdout") stdout += data.toString();
++        else stderr += data.toString();
++        if (stdout.length + stderr.length > OUTPUT_LIMIT) child.kill();
++      };
++      child.stdout.on("data", collect("stdout"));
++      child.stderr.on("data", collect("stderr"));
++
++      child.on("close", (code, signal) => {
++        if (code === 0) return resolve({ stdout, stderr, code });
++        reject(Object.assign(new Error(`Command failed with ${signal ? `signal ${signal}` : `exit code ${code}`}`), {
++          stdout, stderr, code, signal, killed: signal != null
++        }));
+       });
+ 
+       child.on("error", (err) => {
+@@ -137,13 +202,16 @@ export async function run(
+   // Windows / default execution
+   const shell =
+     process.platform === "win32"
+-      ? "powershell.exe"
++      ? windowsBash() || "powershell.exe"
+       : process.env.SHELL || "/bin/sh";
+ 
+-  return execAsync(command, {
++  const { stdout, stderr } = await execAsync(command, {
+     cwd: PROJECT_ROOT,
+-    maxBuffer: 10 * 1024 * 1024,
++    maxBuffer: OUTPUT_LIMIT,
+     timeout,
+-    shell
++    shell,
++    env: childEnv(),
++    windowsHide: true
+   });
++  return { stdout, stderr, code: 0 };
+ }
+diff --git a/src/subagent.ts b/src/subagent.ts
+index 4673563..715393d 100644
+--- a/src/subagent.ts
++++ b/src/subagent.ts
+@@ -1,7 +1,8 @@
+ import type { Tool } from "./tools/types.js";
+ import type { ChatFunctionTool, ChatMessages } from "@openrouter/sdk/models";
+ import { callLLM } from "./llm.js";
+-import { cap, sweep } from "./history.js";
++import { cap, fit, sweep, type SpillScope } from "./history.js";
++import { approver, execute, type Gate } from "./execute.js";
+ import { ui } from "./ui.js";
+ import { config } from "./config.js";
+ 
+@@ -14,6 +15,8 @@ export interface SubagentConfig {
+   allowedTools: Tool[];
+   maxTurns?: number;
+   label?: string;
++  /** Refuse anything the permission rules would ask about, instead of asking. */
++  readOnly?: boolean;
+ }
+ 
+ /**
+@@ -23,7 +26,10 @@ export interface SubagentConfig {
+  * 1. "Nothing goes in": Starts with exactly two messages (role system prompt + task description).
+  * 2. "Only the answer comes back": Internal tool calls/results are private; only the final text is returned.
+  * 3. "Structural tool withholding": Offered only the tools explicitly permitted in `config.allowedTools`.
+- * 4. Context protection: Tool results are capped inline; temp files are cleaned up on exit.
++ * 4. "Same gate as the parent": every call goes through execute() and the permission rules. A read-only
++ *    role cannot even ask; the others ask the same human the main agent does.
++ * 5. Context protection: results are capped into the subagent's OWN spill scope, and the transcript is
++ *    fitted every turn - its context can overflow too, and nobody compacts it.
+  */
+ export async function runSubagent(subagentConfig: SubagentConfig): Promise<string> {
+   const {
+@@ -32,13 +38,18 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+     systemPrompt,
+     allowedTools,
+     maxTurns = config.subagentMaxTurns || 15,
+-    label = role
++    label = role,
++    readOnly = false
+   } = subagentConfig;
+ 
+   const toolMap: Record<string, Tool> = Object.fromEntries(
+     allowedTools.map((t) => [t.name, t])
+   );
+   const toolSchemas: ChatFunctionTool[] = allowedTools.map((t) => t.schema);
++  const gate: Gate = { tools: toolMap, approve: readOnly ? undefined : approver.getStore() };
++  const spills: SpillScope = [];
++  const budget = config.contextWindow * config.compactAt;
++  const fixed = Math.ceil(JSON.stringify(toolSchemas).length / 4);
+ 
+   const messages: ChatMessages[] = [
+     { role: "system", content: systemPrompt },
+@@ -46,6 +57,7 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+   ];
+ 
+   let report = "";
++  ui.subagent(`${label}: ${taskDescription.length > 400 ? `${taskDescription.slice(0, 400)}...` : taskDescription}`);
+   let spinner = ui.working(`${label} working...`);
+ 
+   try {
+@@ -53,6 +65,11 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+       spinner.stop();
+       spinner = ui.working(`${label} working (turn ${turn}/${maxTurns})...`);
+ 
++      if (!fit(messages, budget, fixed, spills).fits) {
++        report ||= `(${label} ran out of context window before it could report.)`;
++        break;
++      }
++
+       const { message, usage } = await callLLM(messages, toolSchemas);
+ 
+       if (usage) {
+@@ -75,44 +92,18 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+ 
+       // Subagent finished if no tool calls requested
+       if (!message.toolCalls || message.toolCalls.length === 0) {
+-        spinner.stop();
+         return report || `${label} completed with no output.`;
+       }
+ 
+-      // Execute requested tools
+       for (const toolCall of message.toolCalls) {
+-        const toolName = toolCall.function.name;
+-        let args: Record<string, any> = {};
+-
+-        try {
+-          args = JSON.parse(toolCall.function.arguments || "{}");
+-        } catch {
+-          // Keep args empty on malformed JSON
+-        }
+-
+-        const tool = toolMap[toolName];
+-        if (!tool) {
+-          messages.push({
+-            role: "tool",
+-            toolCallId: toolCall.id,
+-            content: `Permission denied: Tool "${toolName}" is not available to the ${role} subagent.`
+-          });
+-          continue;
+-        }
+-
+         spinner.stop();
+-        spinner = ui.working(`${label}: running ${toolName}...`);
++        spinner = ui.working(`${label}: running ${toolCall.function.name}...`);
+ 
+-        let result = "";
+-        try {
+-          const raw = await tool.execute(args);
+-          result = typeof raw === "string" ? raw : JSON.stringify(raw, null, 2);
+-        } catch (err: any) {
+-          result = `Tool error: ${err.message || String(err)}`;
+-        }
++        const { args, result } = await execute(toolCall, gate);
++        const capped = cap(result, spills);
+ 
+-        // Inline output cap
+-        const capped = cap(result);
++        spinner.stop();
++        ui.tool(toolCall.function.name, args, capped, true);
+ 
+         messages.push({
+           role: "tool",
+@@ -122,14 +113,26 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
+       }
+     }
+ 
+-    spinner.stop();
+-
+-    if (report) {
+-      return `(stopped after ${maxTurns} turns, before finishing. Partial findings below - narrow the question and ask again.)\n\n${report}`;
++    // Out of turns. Ask once more, for the report only: the last thing it
++    // said is usually "let me check one more file", not a finding.
++    messages.push({
++      role: "user",
++      content: "You are out of turns. Reply now with your report - what you found, what you changed, what is unfinished. Do not call any tools."
++    });
++    try {
++      if (fit(messages, budget, fixed, spills).fits) {
++        const { message } = await callLLM(messages, toolSchemas);
++        if (message.content) report = message.content;
++      }
++    } catch {
++      // keep the last thing it managed to say
+     }
+-    return `(stopped after ${maxTurns} turns with nothing to report.)`;
++
++    return report
++      ? `(stopped after ${maxTurns} turns, before finishing. Partial findings below - narrow the question and ask again.)\n\n${report}`
++      : `(stopped after ${maxTurns} turns with nothing to report.)`;
+   } finally {
+     spinner.stop();
+-    sweep();
++    sweep(spills);
+   }
+ }
+diff --git a/src/tools/bash.ts b/src/tools/bash.ts
+index 0a69e0e..4d57076 100644
+--- a/src/tools/bash.ts
++++ b/src/tools/bash.ts
+@@ -1,10 +1,19 @@
+ import type { Tool } from "./types.js";
+-import { run } from "../sandbox.js";
++import { run, shellKind } from "../sandbox.js";
+ 
+ export interface BashArgs {
+   command: string;
+ }
+ 
++// Without Git for Windows the "bash" tool is really Windows PowerShell 5.1,
++// where &&, 2>/dev/null and `ls -la` all fail - a quarter of the recorded bash
++// calls did. Say so up front rather than let the model find out by failing.
++const SHELL_NOTE =
++  shellKind() === "powershell"
++    ? " Commands run in Windows PowerShell 5.1: chain with ';' (not &&), discard output with '2>$null', " +
++      "and use Get-Content / Select-String instead of head / grep."
++    : "";
++
+ /**
+  * Bash tool for executing shell commands and capturing stdout + stderr.
+  */
+@@ -14,7 +23,7 @@ export const bashTool: Tool<BashArgs, string> = {
+     type: "function",
+     function: {
+       name: "bash",
+-      description: "Run a shell command and return its output.",
++      description: `Run a shell command and return its output and exit code.${SHELL_NOTE}`,
+       parameters: {
+         type: "object",
+         properties: {
+@@ -28,16 +37,22 @@ export const bashTool: Tool<BashArgs, string> = {
+     }
+   },
+   execute: async ({ command }) => {
++    if (typeof command !== "string" || !command.trim()) {
++      return "Error: command must be a non-empty string.";
++    }
+     try {
+       const { stdout, stderr } = await run(command);
+       const output = (stdout + (stderr ? `\nSTDERR:\n${stderr}` : "")).trim();
+       return output || "[Command executed successfully with no output]";
+     } catch (err: any) {
+-      const errorOutput = (
+-        (err.stdout ? err.stdout + "\n" : "") +
+-        (err.stderr || err.message || String(err))
+-      ).trim();
+-      return errorOutput || "Command failed with unknown error.";
++      const output = ((err.stdout || "") + (err.stderr ? `\nSTDERR:\n${err.stderr}` : "")).trim();
++      if (err.killed || err.signal) {
++        // A slow command is the model's problem to work around, not a mystery.
++        return `${output}\n[killed after 60s or for too much output (${err.signal || "SIGTERM"}). Narrow the command down.]`.trim();
++      }
++      // A grep with no match exits 1. "Command failed: grep ..." read like a crash.
++      const status = typeof err.code === "number" ? `[exit code ${err.code}]` : `[${err.message || String(err)}]`;
++      return `${output || "(no output)"}\n${status}`;
+     }
+   }
+ };
+diff --git a/src/tools/orchestrator.ts b/src/tools/orchestrator.ts
+index faef08a..68b5595 100644
+--- a/src/tools/orchestrator.ts
++++ b/src/tools/orchestrator.ts
+@@ -6,7 +6,6 @@ import { stringReplaceTool } from "./stringReplace.js";
+ import { readSkillTool } from "./readSkill.js";
+ import { browserTool } from "./browser.js";
+ import { runSubagent } from "../subagent.js";
+-import { config } from "../config.js";
+ 
+ // --- 1. Planner -------------------------------------------------------------
+ 
+@@ -69,7 +68,8 @@ export const planTool: Tool<PlanTaskArgs, string> = {
+       systemPrompt: getPlannerPrompt(),
+       allowedTools: PLANNER_TOOLS,
+       maxTurns: 10,
+-      label: "planner"
++      label: "planner",
++      readOnly: true
+     });
+   }
+ };
+diff --git a/src/tools/stringReplace.ts b/src/tools/stringReplace.ts
+index db6c44e..350ae9a 100644
+--- a/src/tools/stringReplace.ts
++++ b/src/tools/stringReplace.ts
+@@ -59,7 +59,15 @@ export const stringReplaceTool: Tool<StringReplaceArgs, string> = {
+         return "Error: old_str cannot be empty";
+       }
+ 
+-      const count = content.split(old_str).length - 1;
++      let find = old_str;
++      let swap = new_str;
++      let count = content.split(find).length - 1;
++      if (count === 0 && content.includes("\r\n") && !find.includes("\r\n")) {
++        // The model writes \n; a file checked out with core.autocrlf=true has \r\n.
++        find = find.replace(/\n/g, "\r\n");
++        swap = swap.replace(/\r?\n/g, "\r\n");
++        count = content.split(find).length - 1;
++      }
+       if (count === 0) {
+         return `Error: old_str was not found in ${targetPath}`;
+       }
+@@ -72,13 +80,16 @@ export const stringReplaceTool: Tool<StringReplaceArgs, string> = {
+         );
+       }
+ 
++      // Plain text on both sides. With a string replacement, String.replace
++      // expands $$, $& and $' in new_str - Makefiles and shell scripts are
++      // full of them, and it silently spliced the rest of the file into the edit.
+       const newContent = allow_multi_edit
+-        ? content.replaceAll(old_str, new_str)
+-        : content.replace(old_str, new_str);
++        ? content.split(find).join(swap)
++        : content.replace(find, () => swap);
+ 
+       await fs.writeFile(resolvedPath, newContent, "utf-8");
+       noteRead(targetPath);
+-      return `Replaced text in ${targetPath}`;
++      return `Replaced ${count} match(es) in ${targetPath}`;
+     } catch (err: any) {
+       return `Error replacing text in "${targetPath}": ${err.message || String(err)}`;
+     }
+diff --git a/src/tools/task.ts b/src/tools/task.ts
+index aef2ec3..7230cf0 100644
+--- a/src/tools/task.ts
++++ b/src/tools/task.ts
+@@ -84,7 +84,8 @@ export const taskTool: Tool<TaskArgs, string> = {
+       systemPrompt: getSubagentSystemPrompt(),
+       allowedTools: SUBAGENT_TOOLS,
+       maxTurns: MAX_TURNS,
+-      label: "subagent"
++      label: "subagent",
++      readOnly: true
+     });
+   }
+ };
