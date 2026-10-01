@@ -53,6 +53,13 @@ async function runSession(
           spinner = ui.working("thinking...");
         }
       },
+      onInjection: (content) => {
+        if (debug || content.includes("<system-reminder>")) {
+          spinner.stop();
+          ui.injection(content);
+          spinner = ui.working("thinking...");
+        }
+      },
       onMessage: (content) => {
         spinner.stop();
         ui.agent(content);

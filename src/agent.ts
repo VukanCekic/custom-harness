@@ -7,6 +7,7 @@ import {
   type TimingMetrics
 } from "./llm.js";
 import { executeTool, TOOL_SCHEMAS } from "./tools/index.js";
+import { reminder } from "./context.js";
 
 export interface AgentOptions {
   messages?: ChatMessages[];
@@ -17,7 +18,9 @@ export interface AgentOptions {
   onToolExecution?: (toolName: string, args: Record<string, any>, result: string) => void;
   onMessage?: (content: string) => void;
   onAssistantMessage?: (message: AssistantMessageResult) => void;
+  onInjection?: (content: string) => void;
   onChunk?: (chunk: string) => void;
+  injectReminder?: boolean;
 }
 
 export interface AgentResult {
@@ -62,9 +65,22 @@ export async function runAgent(
       options.onStepStart(step);
     }
 
-    // Call the LLM with current conversation history and available tools
+    // Late injection: a small dynamic block appended just before sending.
+    // Appended to the very end of messages passed to callLLM so the stable prefix
+    // in messages stays cached by the LLM provider.
+    let lateReminder: ChatMessages | null = null;
+    if (options.injectReminder !== false) {
+      lateReminder = reminder();
+      if (options.onInjection && typeof lateReminder.content === "string") {
+        options.onInjection(lateReminder.content);
+      }
+    }
+    const messagesToSend: ChatMessages[] =
+      lateReminder ? [...messages, lateReminder] : messages;
+
+    // Call the LLM with conversation history (+ late injection) and available tools
     const { message, usage, metrics } = await callLLM(
-      messages,
+      messagesToSend,
       TOOL_SCHEMAS,
       options.onChunk
     );

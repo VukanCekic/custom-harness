@@ -2,6 +2,8 @@ import type { ChatFunctionTool } from "@openrouter/sdk/models";
 import type { Tool } from "./types.js";
 import { bashTool } from "./bash.js";
 import { readFileTool } from "./readFile.js";
+import { writeFileTool } from "./writeFile.js";
+import { stringReplaceTool } from "./stringReplace.js";
 import { readSkillTool } from "./readSkill.js";
 import { browserTool } from "./browser.js";
 
@@ -12,15 +14,18 @@ import { browserTool } from "./browser.js";
 export const registeredTools: Tool[] = [
   bashTool,
   readFileTool,
+  writeFileTool,
+  stringReplaceTool,
   readSkillTool,
   browserTool
 ];
 
 export const TOOL_SCHEMAS: ChatFunctionTool[] = registeredTools.map((t) => t.schema);
 
-export const TOOLS_BY_NAME: Record<string, Tool> = Object.fromEntries(
-  registeredTools.map((t) => [t.name, t])
-);
+export const TOOLS_BY_NAME: Record<string, Tool> = {
+  ...Object.fromEntries(registeredTools.map((t) => [t.name, t])),
+  str_replace: stringReplaceTool
+};
 
 /**
  * Dispatches and executes a tool by name with provided arguments.
@@ -38,5 +43,7 @@ export async function executeTool(name: string, args: Record<string, any>): Prom
 export * from "./types.js";
 export * from "./bash.js";
 export * from "./readFile.js";
+export * from "./writeFile.js";
+export * from "./stringReplace.js";
 export * from "./readSkill.js";
 export * from "./browser.js";

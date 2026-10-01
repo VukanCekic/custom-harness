@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Tool } from "./types.js";
+import { noteRead } from "../context.js";
 
 export interface ReadFileArgs {
   path: string;
@@ -32,6 +33,7 @@ export const readFileTool: Tool<ReadFileArgs, string> = {
     try {
       const resolvedPath = path.resolve(process.cwd(), targetPath);
       const content = await fs.readFile(resolvedPath, "utf-8");
+      noteRead(targetPath);
       return content || "(file is empty)";
     } catch (err: any) {
       return `Error reading file "${targetPath}": ${err.message || String(err)}`;
