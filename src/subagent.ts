@@ -1,9 +1,9 @@
 import type { Tool } from "./tools/types.js";
-import type { ChatFunctionTool, ChatMessages } from "@openrouter/sdk/models";
+import type { ChatFunctionTool, ChatMessages, ChatToolCall } from "@openrouter/sdk/models";
 import { callLLM, spentSince, tally } from "./llm.js";
 import { cap, fit, sweep, type SpillScope } from "./history.js";
-import { approver, execute, type Gate } from "./execute.js";
-import { current, within, type Role } from "./scope.js";
+import { approver, cutOff, execute, type Gate } from "./execute.js";
+import { CancelledError, current, within, type Role } from "./scope.js";
 import { shortStatus } from "./git.js";
 import { ui } from "./ui.js";
 import { config } from "./config.js";
@@ -25,6 +25,18 @@ export interface SubagentConfig {
   timeoutMs?: number;
 }
 
+/** How a run ended. Only "done" means the text is a finished answer. */
+export type SubagentStatus = "done" | "out_of_turns" | "out_of_context" | "cancelled" | "timeout" | "failed";
+
+export interface SubagentOutcome {
+  status: SubagentStatus;
+  /** What the parent gets back: the report, or partial findings plus the state of the tree. */
+  text: string;
+}
+
+const NOT_RUN = "[not run: the report was already submitted]";
+const CANCELLED = "[cancelled before this ran]";
+
 /**
  * Universal subagent runner with an isolated context window.
  *
@@ -38,8 +50,14 @@ export interface SubagentConfig {
  *    fitted every turn - its context can overflow too, and nobody compacts it.
  * 6. It always reports. Out of turns, out of time, cancelled or crashed, the parent gets what it had
  *    found so far and what the working tree looks like now - never a bare "Tool error".
+ * 7. Cancelled means stopped: once the turn is cancelled or the deadline passes, no further call runs.
  */
 export async function runSubagent(subagentConfig: SubagentConfig): Promise<string> {
+  return (await runSubagentDetailed(subagentConfig)).text;
+}
+
+/** runSubagent, plus how the run ended - so a caller never mistakes partial notes for a result. */
+export async function runSubagentDetailed(subagentConfig: SubagentConfig): Promise<SubagentOutcome> {
   const {
     role,
     taskDescription,
@@ -75,17 +93,63 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
   ui.subagent(`${label}: ${taskDescription.length > 400 ? `${taskDescription.slice(0, 400)}...` : taskDescription}`);
   let spinner = ui.working(`${label} working...`);
 
-  const loop = async (): Promise<string> => {
+  /** Run one reply's tool calls. True once `finishOn` has run successfully. */
+  const runCalls = async (calls: ChatToolCall[], truncated: boolean): Promise<boolean> => {
+    let finished = false;
+    for (let index = 0; index < calls.length; index++) {
+      const toolCall = calls[index];
+      if (finished) {
+        // the run is over; answer the remaining calls so the transcript stays valid
+        messages.push({ role: "tool", toolCallId: toolCall.id, content: NOT_RUN });
+        continue;
+      }
+      // A worker used to carry on writing files after the user had cancelled.
+      if (signal.aborted) {
+        for (const pending of calls.slice(index)) {
+          messages.push({ role: "tool", toolCallId: pending.id, content: CANCELLED });
+        }
+        throw signal.reason instanceof Error ? signal.reason : new CancelledError();
+      }
+      spinner.stop();
+      spinner = ui.working(`${label}: running ${toolCall.function.name}...`);
+
+      const cut = truncated ? cutOff(toolCall) : null;
+      const { args, result } = cut ? { args: {}, result: cut } : await execute(toolCall, gate);
+      const capped = cap(result, spills);
+
+      spinner.stop();
+      ui.tool(toolCall.function.name, args, capped, true);
+
+      messages.push({
+        role: "tool",
+        toolCallId: toolCall.id,
+        content: capped
+      });
+
+      if (finishOn && toolCall.function.name === finishOn && !/^(Error|Permission denied|Tool error)/.test(result)) {
+        finished = true;
+        report ||= result;
+      }
+    }
+    return finished;
+  };
+
+  const partial = (why: string): string =>
+    report
+      ? `(${why}, before finishing. Partial findings below - narrow the question and ask again.)\n\n${report}`
+      : `(${why} with nothing to report.)`;
+
+  const loop = async (): Promise<SubagentOutcome> => {
     for (let turn = 1; turn <= maxTurns; turn++) {
       spinner.stop();
       spinner = ui.working(`${label} working (turn ${turn}/${maxTurns})...`);
 
       if (!fit(messages, budget, fixed, spills).fits) {
-        report ||= `(${label} ran out of context window before it could report.)`;
-        break;
+        // Said as what it is - it used to be reported as "stopped after N turns".
+        return { status: "out_of_context", text: partial(`${label} ran out of context window`) };
       }
 
-      const { message, usage } = await callLLM(messages, toolSchemas);
+      const { message, usage, finishReason } = await callLLM(messages, toolSchemas);
 
       if (usage) {
         spinner.stop();
@@ -109,57 +173,46 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
 
       // Subagent finished if no tool calls requested
       if (!message.toolCalls || message.toolCalls.length === 0) {
-        return report || `${label} completed with no output.`;
+        return { status: "done", text: report || `${label} completed with no output.` };
       }
 
-      let finished = false;
-      for (const toolCall of message.toolCalls) {
-        if (finished) {
-          // the run is over; answer the remaining calls so the transcript stays valid
-          messages.push({ role: "tool", toolCallId: toolCall.id, content: "[not run: the report was already submitted]" });
-          continue;
-        }
-        spinner.stop();
-        spinner = ui.working(`${label}: running ${toolCall.function.name}...`);
-
-        const { args, result } = await execute(toolCall, gate);
-        const capped = cap(result, spills);
-
-        spinner.stop();
-        ui.tool(toolCall.function.name, args, capped, true);
-
-        messages.push({
-          role: "tool",
-          toolCallId: toolCall.id,
-          content: capped
-        });
-
-        if (finishOn && toolCall.function.name === finishOn && !/^(Error|Permission denied|Tool error)/.test(result)) {
-          finished = true;
-          report ||= result;
-        }
+      if (await runCalls(message.toolCalls, finishReason === "length")) {
+        return { status: "done", text: report };
       }
-      if (finished) return report;
     }
 
     // Out of turns. Ask once more, for the report only: the last thing it
-    // said is usually "let me check one more file", not a finding.
+    // said is usually "let me check one more file", not a finding. A role that
+    // reports through a tool is offered that tool alone and must call it -
+    // told "do not call any tools", the reviewer could never deliver its
+    // verdict, and no verdict counts as changes_requested.
+    const reportTool = finishOn ? toolMap[finishOn]?.schema : undefined;
     messages.push({
       role: "user",
-      content: "You are out of turns. Reply now with your report - what you found, what you changed, what is unfinished. Do not call any tools."
+      content: reportTool
+        ? `You are out of turns. Call ${finishOn} now with what you have found so far. Do not call any other tool.`
+        : "You are out of turns. Reply now with your report - what you found, what you changed, what is unfinished. Do not call any tools."
     });
     try {
       if (fit(messages, budget, fixed, spills).fits) {
-        const { message } = await callLLM(messages, toolSchemas);
+        const { message } = await callLLM(
+          messages,
+          reportTool ? [reportTool] : toolSchemas,
+          reportTool ? { toolChoice: "required" } : {}
+        );
         if (message.content) report = message.content;
+        const calls = (message.toolCalls ?? []).filter((c) => c.function.name === finishOn);
+        if (reportTool && calls.length > 0) {
+          messages.push({ role: "assistant", content: message.content || "", toolCalls: calls } as ChatMessages);
+          if (await runCalls(calls, false)) return { status: "done", text: report };
+        }
       }
-    } catch {
+    } catch (err) {
+      if (signal.aborted) throw err;
       // keep the last thing it managed to say
     }
 
-    return report
-      ? `(stopped after ${maxTurns} turns, before finishing. Partial findings below - narrow the question and ask again.)\n\n${report}`
-      : `(stopped after ${maxTurns} turns with nothing to report.)`;
+    return { status: "out_of_turns", text: partial(`stopped after ${maxTurns} turns`) };
   };
 
   try {
@@ -167,17 +220,22 @@ export async function runSubagent(subagentConfig: SubagentConfig): Promise<strin
   } catch (err: any) {
     // Files the worker already changed stay changed, so the parent needs to
     // know what the tree looks like now, not just that something went wrong.
-    const why = parent?.aborted
-      ? "was cancelled by the user"
-      : deadline.aborted
-        ? `ran out of time (${Math.round(timeoutMs / 1000)}s)`
-        : `failed: ${err?.message || String(err)}`;
-    const status = await shortStatus();
-    return [
-      `(${label} ${why} before finishing.)`,
-      report ? `Last thing it reported:\n${report}` : "",
-      `Working tree now (git status --short):\n${status || "(clean, or not a git repository)"}`
-    ].filter(Boolean).join("\n\n");
+    const status: SubagentStatus = parent?.aborted ? "cancelled" : deadline.aborted ? "timeout" : "failed";
+    const why =
+      status === "cancelled"
+        ? "was cancelled by the user"
+        : status === "timeout"
+          ? `ran out of time (${Math.round(timeoutMs / 1000)}s)`
+          : `failed: ${err?.message || String(err)}`;
+    const tree = await shortStatus();
+    return {
+      status,
+      text: [
+        `(${label} ${why} before finishing.)`,
+        report ? `Last thing it reported:\n${report}` : "",
+        `Working tree now (git status --short):\n${tree || "(clean, or not a git repository)"}`
+      ].filter(Boolean).join("\n\n")
+    };
   } finally {
     spinner.stop();
     sweep(spills);

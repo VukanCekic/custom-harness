@@ -208,6 +208,8 @@ export interface Compaction {
   before: number;
   after: number;
   cost: number;
+  /** The transcript was rewritten. Not the same as after < before: one message can replace one. */
+  changed: boolean;
 }
 
 /**
@@ -222,9 +224,14 @@ export interface Compaction {
 export async function compact(messages: ChatMessages[], force = false): Promise<Compaction> {
   const before = messages.length;
   const budget = force ? 0 : config.contextWindow * config.compactTo;
-  const cut = tailStart(messages, budget);
+  // Never cut into the exchange the model has not read yet: summarising those
+  // results hands it a paraphrase of output it asked for and never saw. If
+  // they are too big to keep whole, fit() squeezes them to a pointer instead.
+  const fresh = live(messages);
+  const unreadFrom = fresh < messages.length ? fresh - 1 : messages.length;
+  const cut = Math.min(tailStart(messages, budget), unreadFrom);
   if (cut <= 1) {
-    return { before, after: before, cost: 0 }; // nothing old enough to be worth summarising
+    return { before, after: before, cost: 0, changed: false }; // nothing old enough to be worth summarising
   }
 
   const old = messages.slice(1, cut);
@@ -252,5 +259,5 @@ export async function compact(messages: ChatMessages[], force = false): Promise<
 
   // In-place update so caller references stay in sync
   messages.splice(0, messages.length, ...kept);
-  return { before, after: messages.length, cost };
+  return { before, after: messages.length, cost, changed: true };
 }

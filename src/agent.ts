@@ -14,7 +14,7 @@ import { TOOL_SCHEMAS, toolsFor } from "./tools/index.js";
 import { reminder } from "./context.js";
 import { cap, sweep, settle, fit, estimate } from "./history.js";
 import { compact } from "./compact.js";
-import { approver, asker, execute, peek, type Asker } from "./execute.js";
+import { approver, asker, cutOff, execute, peek, type Asker } from "./execute.js";
 import { blame, observe, type CacheBreak } from "./cache.js";
 import { CancelledError, within, type Role } from "./scope.js";
 
@@ -34,8 +34,12 @@ export interface AgentOptions {
   onChunk?: (chunk: string) => void;
   onCompacted?: (before: number, messages: ChatMessages[]) => void;
   onNote?: (text: string) => void;
-  /** Called after every change to the transcript, so a session log can keep up. */
-  onTranscript?: (messages: ChatMessages[]) => void;
+  /**
+   * Called after every change to the transcript, so a session log can keep up.
+   * `replaced` names a rewrite (compaction) the log must record whole: the
+   * message count alone cannot tell, since one message can replace one.
+   */
+  onTranscript?: (messages: ChatMessages[], replaced?: string) => void;
   onCacheBreak?: (info: CacheBreak) => void;
   onModeChange?: (mode: Mode) => void;
   injectReminder?: boolean;
@@ -180,15 +184,16 @@ export async function runAgent(
 
       // 1. Compaction first: it summarises what it removes, fit() only loses it.
       //    Checked before the request, so no call is paid for and then thrown away.
-      const size = estimate(messages);
-      if (size + fixed > budget && size - compactedAt > config.contextWindow * 0.25) {
+      let compactedNow = false;
+      const tryCompact = async () => {
+        compactedNow = true;
         const before = messages.length;
         try {
           blame(messages, "compaction");
           const done = await compact(messages);
-          if (done.after < before) {
+          if (done.changed) {
             compactions.push({ step, before, after: done.after, cost: done.cost });
-            persist();
+            options.onTranscript?.(messages, "compaction");
             options.onCompacted?.(before, messages);
           }
         } catch (err: any) {
@@ -198,11 +203,21 @@ export async function runAgent(
           options.onNote?.(`compaction failed (${err.message || String(err)}); continuing without it`);
         }
         compactedAt = estimate(messages);
+      };
+      const size = estimate(messages);
+      if (size + fixed > budget && size - compactedAt > config.contextWindow * 0.25) {
+        await tryCompact();
       }
 
       // 2. Last resort. It refuses an unreachable target rather than dropping
-      //    every result on the way to failing anyway, so stop loudly instead.
-      const fitted = fit(messages, budget, fixed);
+      //    every result on the way to failing anyway. Before stopping the turn,
+      //    one compaction the cooldown held back is still better than none.
+      let fitted = fit(messages, budget, fixed);
+      const floorOfPrompt = fixed + estimate([messages[0]]);
+      if (!fitted.fits && !compactedNow && floorOfPrompt <= budget) {
+        await tryCompact();
+        fitted = fit(messages, budget, fixed);
+      }
       if (fitted.stubbed + fitted.elided + fitted.dropped + fitted.squeezed > 0) {
         blame(messages, "fit");
         options.onNote?.(
@@ -212,9 +227,12 @@ export async function runAgent(
       }
       if (!fitted.fits) {
         throw new ContextBudgetError(
-          `This request needs ~${fitted.floor} tokens even with every old tool result dropped, but the budget is ` +
-          `${budget} (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}, ~${fixed} of it tool schemas). ` +
-          `Raise CONTEXT_WINDOW or run /compact.`
+          floorOfPrompt > budget
+            ? `The tool schemas and system prompt alone need ~${floorOfPrompt} tokens, more than the ${Math.round(budget)}-token ` +
+              `budget (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}). Raise CONTEXT_WINDOW; /compact cannot help.`
+            : `This request needs ~${fitted.floor} tokens even with every old tool result dropped, but the budget is ` +
+              `${Math.round(budget)} (CONTEXT_WINDOW=${config.contextWindow} x COMPACT_AT=${config.compactAt}; ~${fixed} of it ` +
+              `tool schemas and the reminder reserve). Raise CONTEXT_WINDOW or run /compact.`
         );
       }
 
@@ -238,10 +256,11 @@ export async function runAgent(
       }
 
       // Call the LLM with conversation history (+ late injection) and available tools
-      const { message, usage, metrics } = await callLLM(messagesToSend, tools.schemas, {
+      const { message, usage, metrics, finishReason } = await callLLM(messagesToSend, tools.schemas, {
         onChunk: options.onChunk,
         stable: messages.length
       });
+      const truncated = finishReason === "length";
 
       lastUsage = usage;
       lastMetrics = metrics;
@@ -279,6 +298,10 @@ export async function runAgent(
 
       // If no tool calls were requested, the agent is done
       if (!message.toolCalls || message.toolCalls.length === 0) {
+        if (truncated) {
+          finalResponse += "\n\n(the answer was cut off: it hit the output-token limit)";
+          options.onNote?.("the answer hit the output-token limit and is incomplete - say \"continue\" for the rest");
+        }
         if (options.onStepEnd) {
           options.onStepEnd(step, usage);
         }
@@ -309,9 +332,12 @@ export async function runAgent(
         // In pipeline mode the agent's own bash is read-only: anything that
         // would need approval is refused, so edits go through the worker.
         const approve = mode === "pipeline" && toolName === "bash" ? undefined : options.onApprove;
-        const { args, result } = await approver.run(options.onApprove, () =>
-          asker.run(options.onAsk, () => execute(toolCall, { tools: tools.byName, approve }))
-        );
+        const cut = truncated ? cutOff(toolCall) : null;
+        const { args, result } = cut
+          ? { args: {}, result: cut }
+          : await approver.run(options.onApprove, () =>
+              asker.run(options.onAsk, () => execute(toolCall, { tools: tools.byName, approve }))
+            );
 
         // Cap fresh tool result: if oversized, spill to disk and replace with pointer
         const cappedResult = cap(result);

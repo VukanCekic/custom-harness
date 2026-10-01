@@ -1,11 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { exec, execSync, spawn } from "node:child_process";
-import { promisify } from "node:util";
+import { execSync, spawn, type ChildProcess } from "node:child_process";
 import { current } from "./scope.js";
-
-const execAsync = promisify(exec);
 
 const OUTPUT_LIMIT = 10 * 1024 * 1024;
 
@@ -163,6 +160,25 @@ export interface RunResult {
 }
 
 /**
+ * Stop a command and everything it started. Killing just the shell left its
+ * children running on Windows - a timed-out `npm test` kept its node workers,
+ * a cancelled dev server kept its port.
+ */
+function killTree(child: ChildProcess): void {
+  if (child.pid == null || child.exitCode != null) return;
+  if (process.platform === "win32") {
+    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+      .on("error", () => child.kill());
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL"); // the process group spawn() gave it
+  } catch {
+    child.kill("SIGKILL");
+  }
+}
+
+/**
  * Runs a command within project boundary, sandboxed when the OS lets us.
  * Rejects (like exec) on a non-zero exit, a timeout, or runaway output.
  */
@@ -170,53 +186,61 @@ export async function run(command: string, timeout = 60000): Promise<RunResult> 
   const sandboxed = wrap(command);
   // Ctrl+C or a subagent's time limit kills the command, not just the wait for it.
   const signal = current().signal;
-
-  if (sandboxed) {
-    return new Promise((resolve, reject) => {
-      const child = spawn(sandboxed[0], sandboxed.slice(1), {
-        cwd: PROJECT_ROOT,
-        timeout,
-        env: childEnv(),
-        signal
-      });
-
-      let stdout = "";
-      let stderr = "";
-      const collect = (target: "stdout" | "stderr") => (data: Buffer) => {
-        if (target === "stdout") stdout += data.toString();
-        else stderr += data.toString();
-        if (stdout.length + stderr.length > OUTPUT_LIMIT) child.kill();
-      };
-      child.stdout.on("data", collect("stdout"));
-      child.stderr.on("data", collect("stderr"));
-
-      child.on("close", (code, signal) => {
-        if (code === 0) return resolve({ stdout, stderr, code });
-        reject(Object.assign(new Error(`Command failed with ${signal ? `signal ${signal}` : `exit code ${code}`}`), {
-          stdout, stderr, code, signal, killed: signal != null
-        }));
-      });
-
-      child.on("error", (err) => {
-        reject(err);
-      });
-    });
-  }
-
-  // Windows / default execution
   const shell =
     process.platform === "win32"
       ? windowsBash() || "powershell.exe"
       : process.env.SHELL || "/bin/sh";
+  const [file, args] = sandboxed ? [sandboxed[0], sandboxed.slice(1)] : [shell, ["-c", command]];
 
-  const { stdout, stderr } = await execAsync(command, {
-    cwd: PROJECT_ROOT,
-    maxBuffer: OUTPUT_LIMIT,
-    timeout,
-    shell,
-    env: childEnv(),
-    windowsHide: true,
-    signal
+  return new Promise((resolve, reject) => {
+    const child = spawn(file, args, {
+      cwd: PROJECT_ROOT,
+      env: childEnv(),
+      windowsHide: true,
+      detached: process.platform !== "win32" // its own process group, so killTree reaches its children
+    });
+    // Nothing is ever typed into a command: a bare `cat` gets EOF, not a 60s wait.
+    child.stdin?.end();
+
+    let stdout = "";
+    let stderr = "";
+    let stopped: "timeout" | "cancel" | "output" | null = null;
+    const stop = (why: NonNullable<typeof stopped>) => {
+      if (stopped) return;
+      stopped = why;
+      killTree(child);
+    };
+    const timer = setTimeout(() => stop("timeout"), timeout);
+    const onAbort = () => stop("cancel");
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+
+    const collect = (target: "stdout" | "stderr") => (data: Buffer) => {
+      if (target === "stdout") stdout += data.toString();
+      else stderr += data.toString();
+      if (stdout.length + stderr.length > OUTPUT_LIMIT) stop("output");
+    };
+    child.stdout?.on("data", collect("stdout"));
+    child.stderr?.on("data", collect("stderr"));
+
+    const settle = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    child.on("close", (code, killedBy) => {
+      settle();
+      if (stopped === "cancel") {
+        return reject(Object.assign(new Error("cancelled"), { name: "AbortError", stdout, stderr }));
+      }
+      if (code === 0 && !stopped) return resolve({ stdout, stderr, code });
+      const how = stopped ? `${stopped === "timeout" ? "a timeout" : "too much output"}` : killedBy ? `signal ${killedBy}` : `exit code ${code}`;
+      reject(Object.assign(new Error(`Command failed with ${how}`), {
+        stdout, stderr, code, signal: killedBy ?? (stopped ? "SIGTERM" : null), killed: stopped != null || killedBy != null
+      }));
+    });
+    child.on("error", (err) => {
+      settle();
+      reject(err);
+    });
   });
-  return { stdout, stderr, code: 0 };
 }

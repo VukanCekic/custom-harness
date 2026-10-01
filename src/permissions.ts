@@ -1,6 +1,7 @@
 import { insideProject, PROJECT_ROOT, shellKind } from "./sandbox.js";
 import { browserTarget, parseBrowserArgs } from "./tools/browser.js";
 import { config } from "./config.js";
+import { isSpill } from "./history.js";
 
 export type PermissionAction = "allow" | "ask" | "deny";
 
@@ -12,7 +13,70 @@ export interface PermissionCheck {
 }
 
 /** Paths whose contents should never reach the model without a human saying so. */
-const SECRETS = /(\.ssh|\.aws|\.gnupg|\.netrc|\bid_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[\s/\\"'=])\.env(\.|\b|$))/i;
+const SECRETS =
+  /(\.ssh|\.aws|\.gnupg|\.netrc|\.npmrc|\.pypirc|\.git-credentials|\.docker[\\/]config\.json|\.kube[\\/]config|\bgh[\\/]hosts\.ya?ml|\bid_(rsa|ed25519|ecdsa)\b|\bcredentials\b|(^|[\s/\\"'=<])\.env(\.|\b|$))/i;
+
+/** Names SECRETS protects, to test shell globs against: `cat .en?` is `cat .env`. */
+const SECRET_NAMES = [".env", ".env.local", ".env.production", ".npmrc", ".pypirc", ".netrc", ".git-credentials", "credentials", "id_rsa", "id_ed25519", "id_ecdsa"];
+
+/**
+ * The words of a command as the shell sees them once quotes and escapes are
+ * gone - `.e''nv`, `".env"` and `.e\nv` are all `.env` - and whether each one
+ * still holds an unquoted glob character the shell will expand.
+ */
+function words(command: string, posix: boolean): Array<{ word: string; glob: boolean }> {
+  const escape = posix ? "\\" : "`";
+  const out: Array<{ word: string; glob: boolean }> = [];
+  let word = "";
+  let glob = false;
+  let quote: string | null = null;
+  const flush = () => {
+    if (word) out.push({ word, glob });
+    word = "";
+    glob = false;
+  };
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) quote = null;
+      else word += char;
+    } else if (char === escape) {
+      word += command[++index] ?? "";
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (/[\s;&|<>()]/.test(char)) {
+      flush();
+    } else {
+      if (char === "*" || char === "?" || char === "[") glob = true;
+      word += char;
+    }
+  }
+  flush();
+  return out;
+}
+
+function globMatches(pattern: string, name: string): boolean {
+  const regex = pattern.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+  try {
+    return new RegExp(`^${regex}$`, "i").test(name);
+  } catch {
+    return true; // an odd bracket expression: assume the worst
+  }
+}
+
+/**
+ * Could this word, once the shell has expanded it, name a credentials file?
+ * Globs follow the shell's rules: a leading dot has to be written out, and a
+ * pattern of nothing but wildcards (`ls *`, `cat src/*`) aims at no file in
+ * particular - asking about those would make every listing need approval.
+ */
+function touchesSecret({ word, glob }: { word: string; glob: boolean }): boolean {
+  if (SECRETS.test(word)) return true;
+  if (!glob) return false;
+  const base = word.split(/[\\/]/).pop() ?? word;
+  if (!/[^*?]/.test(base.replace(/\[[^\]]*\]/g, ""))) return false;
+  return SECRET_NAMES.some((name) => name.startsWith(".") === base.startsWith(".") && globMatches(base, name));
+}
 
 /**
  * Wildcard matcher supporting * and ?
@@ -109,6 +173,11 @@ export function effects(command: string, posix = shellKind() === "posix"): strin
       quote = char;
     } else if (char === "$" && next === "(") {
       found.add("runs a command substitution");
+      index++;
+    } else if (!posix && char === "(") {
+      // PowerShell evaluates (...) and @(...) anywhere in a command line:
+      // `Get-Content (Remove-Item -Recurse src)` deletes src.
+      found.add("runs a subexpression");
     } else if (posix && char === "`") {
       found.add("runs a command substitution");
     } else if ((char === "<" || char === ">") && next === "(") {
@@ -127,7 +196,9 @@ export function effects(command: string, posix = shellKind() === "posix"): strin
     }
   }
 
-  if (SECRETS.test(command)) found.add("reads or writes a credentials file");
+  if (SECRETS.test(command) || words(command, posix).some(touchesSecret)) {
+    found.add("reads or writes a credentials file");
+  }
   return [...found];
 }
 
@@ -209,19 +280,35 @@ export const BASH_RULES: Array<[string, PermissionAction]> = [
  * Flags that turn an allow-listed reader into a writer.
  */
 const RISKY_FLAGS: RegExp[] = [
-  /^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/i,
-  /^git\s+branch\b.*\s(-d|-D|-m|-M|-c|-C|-f|--delete|--move|--copy|--force)\b/,
+  /^find\b.*\s-(delete|exec|execdir|ok|okdir|fprint0?|fprintf|fls)\b/i,
+  /^git\s+branch\b.*\s(-d|-D|-m|-M|-c|-C|-f|-u|-t|--delete|--move|--copy|--force|--set-upstream-to|--unset-upstream|--track|--edit-description)\b/,
   /^git\s+(diff|log|show)\b.*\s--output\b/,
-  /^sort\b.*\s(-o|--output)\b/,
-  /^tree\b.*\s-o\b/,
+  /^git\s+diff\b.*\s--no-index\b/, // diffs any two files on disk, outside the project too
+  /^sort\b.*\s(-[a-zA-Z]*o|--o)/, // -o FILE, -oFILE, -uo FILE, and GNU's abbreviations --out=, --outp=...
+  /^tree\b.*\s-o/,
+  /^(rg|ripgrep)\b.*\s--pre\b/, // runs COMMAND on every file it searches
+  /^date\b.*\s(-s|--set)\b/,
   /^(Get-ChildItem|gci|dir|ls)\b.*\benv:/i
 ];
 
+/** `uniq INPUT OUTPUT` writes OUTPUT. */
+function uniqWrites(part: string): boolean {
+  const [command, ...rest] = part.trim().split(/\s+/);
+  return command === "uniq" && rest.filter((arg) => !arg.startsWith("-")).length >= 2;
+}
+
+/**
+ * Allow-listed commands that run the project's own code (conftest.py, test
+ * files). Fine while a human can watch; not for a role that cannot ask, since
+ * write_file needs no approval inside the project and pytest would run it.
+ */
+const RUNS_PROJECT_CODE: RegExp[] = [/^pytest\b/i, /^python3?\s+-m\s+pytest\b/i];
+
 /**
  * Rate every part of a compound command; the strictest verdict wins.
- * Precedence: deny > ask > allow
+ * Precedence: deny > ask > allow. `strict` is for callers that cannot ask.
  */
-export function decide(command: string, posix = shellKind() === "posix"): PermissionAction {
+export function decide(command: string, posix = shellKind() === "posix", strict = false): PermissionAction {
   const verdicts: PermissionAction[] = [];
 
   for (const part of splitCommand(command, posix)) {
@@ -231,7 +318,11 @@ export function decide(command: string, posix = shellKind() === "posix"): Permis
         action = rule;
       }
     }
-    if (action === "allow" && RISKY_FLAGS.some((flag) => flag.test(part.trim()))) {
+    const trimmed = part.trim();
+    if (action === "allow" && (RISKY_FLAGS.some((flag) => flag.test(trimmed)) || uniqWrites(trimmed))) {
+      action = "ask";
+    }
+    if (strict && action === "allow" && RUNS_PROJECT_CODE.some((rule) => rule.test(trimmed))) {
       action = "ask";
     }
     verdicts.push(action);
@@ -297,22 +388,35 @@ function checkBrowser(args: Record<string, any>): PermissionCheck {
 }
 
 /**
- * Return (action, reason). Action is allow, ask or deny.
+ * Return (action, reason). Action is allow, ask or deny. `strict` is set for
+ * callers that cannot ask (read-only subagents, pipeline-mode bash).
  */
-export function check(name: string, args: Record<string, any>): PermissionCheck {
+export function check(name: string, args: Record<string, any>, options: { strict?: boolean } = {}): PermissionCheck {
   if (name === "browser") {
     return checkBrowser(args);
   }
 
-  if ((name === "grep" || name === "glob") && args.path && !insideProject(String(args.path))) {
-    return { action: "ask", reason: `${name} outside ${PROJECT_ROOT}: ${args.path}` };
+  // The harness's own temp files, written for this agent to page through.
+  // They live in the OS temp directory, so the outside-the-project rule used
+  // to ask every time - and refuse read-only roles outright.
+  if ((name === "read_file" || name === "grep") && args.path && isSpill(String(args.path))) {
+    return { action: "allow" };
+  }
+
+  if ((name === "grep" || name === "glob") && args.path) {
+    if (!insideProject(String(args.path))) {
+      return { action: "ask", reason: `${name} outside ${PROJECT_ROOT}: ${args.path}` };
+    }
+    if (SECRETS.test(String(args.path))) {
+      return { action: "ask", reason: `${name} on a credentials file: ${args.path}` };
+    }
   }
 
   if (name === "bash") {
     const cmd = String(args.command || "");
     const why = effects(cmd);
     return {
-      action: decide(cmd),
+      action: decide(cmd, undefined, options.strict),
       reason: why.length > 0 ? `run (${why.join(", ")}): ${cmd}` : `run: ${cmd}`
     };
   }

@@ -149,6 +149,8 @@ export interface CallLLMResult {
   message: AssistantMessageResult;
   usage: DetailedUsage | null;
   metrics: TimingMetrics;
+  /** "length" means the reply hit the output limit and its last tool call is cut off. */
+  finishReason: string | null;
 }
 
 export interface CallOptions {
@@ -162,7 +164,11 @@ export interface CallOptions {
    * follows (the late reminder) changes every call and must not be cached.
    */
   stable?: number;
+  /** "required" makes the model call one of `tools` - e.g. the reviewer's last turn. */
+  toolChoice?: "auto" | "required" | "none";
 }
+
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || undefined;
 
 const EPHEMERAL = { type: "ephemeral" as const };
 
@@ -300,7 +306,9 @@ export async function callLLM(
           messages: request.messages,
           tools: request.tools,
           stream: true,
-          provider: config.provider
+          provider: config.provider,
+          ...(opts.toolChoice && request.tools ? { toolChoice: opts.toolChoice } : {}),
+          ...(MAX_OUTPUT_TOKENS ? { maxTokens: MAX_OUTPUT_TOKENS } : {})
         }
       },
       { ...RETRY, signal: abort }
@@ -441,6 +449,7 @@ export async function callLLM(
           : undefined
     },
     usage,
-    metrics
+    metrics,
+    finishReason
   };
 }

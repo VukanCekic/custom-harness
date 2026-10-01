@@ -21,6 +21,7 @@ export interface MockTurn {
   omitIndex?: boolean; // some upstreams omit tool_call.index
   reasoningDetails?: any[]; // streamed as reasoning_details, split across two chunks
   delayMs?: number; // wait before answering; honours the request's abort signal
+  finishReason?: string; // override the final finish_reason, e.g. "length"
 }
 
 export type Script = (body: any, callIndex: number) => MockTurn | Promise<MockTurn>;
@@ -96,7 +97,7 @@ export function install() {
     const promptTokens = turn.promptTokens ?? Math.ceil(bodyText.length / 4);
     chunks.push({
       ...base,
-      choices: [{ index: 0, delta: {}, finish_reason: turn.toolCalls?.length ? "tool_calls" : "stop" }],
+      choices: [{ index: 0, delta: {}, finish_reason: turn.finishReason ?? (turn.toolCalls?.length ? "tool_calls" : "stop") }],
       usage: {
         prompt_tokens: promptTokens,
         completion_tokens: 50,
