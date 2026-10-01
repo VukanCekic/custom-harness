@@ -6,7 +6,6 @@ import type {
   ChatToolCall
 } from "@openrouter/sdk/models";
 import { config } from "./config.js";
-import { TOOL_SCHEMAS } from "./tools/index.js";
 
 const openrouter = new OpenRouter({
   apiKey: config.apiKey
@@ -83,7 +82,7 @@ export interface CallLLMResult {
  */
 export async function callLLM(
   messages: ChatMessages[],
-  tools: ChatFunctionTool[] | null = TOOL_SCHEMAS,
+  tools?: ChatFunctionTool[] | null,
   onChunk?: (chunk: string) => void
 ): Promise<CallLLMResult> {
   const requestStartTime = performance.now();

@@ -15,11 +15,11 @@ export interface StringReplaceArgs {
  * Matches exact text; old_str must match uniquely unless allow_multi_edit is true.
  */
 export const stringReplaceTool: Tool<StringReplaceArgs, string> = {
-  name: "string_replace",
+  name: "str_replace",
   schema: {
     type: "function",
     function: {
-      name: "string_replace",
+      name: "str_replace",
       description: "Swap exact text in a file. old_str must match exactly once unless allow_multi_edit is set to true.",
       parameters: {
         type: "object",

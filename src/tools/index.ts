@@ -1,5 +1,7 @@
 import type { ChatFunctionTool } from "@openrouter/sdk/models";
 import type { Tool } from "./types.js";
+import { taskTool } from "./task.js";
+import { planTool, workTool, reviewTool } from "./orchestrator.js";
 import { bashTool } from "./bash.js";
 import { readFileTool } from "./readFile.js";
 import { writeFileTool } from "./writeFile.js";
@@ -13,6 +15,10 @@ import { browserTool } from "./browser.js";
  * To add a new tool in the future, simply define it and add it to this list.
  */
 export const registeredTools: Tool[] = [
+  planTool,
+  workTool,
+  reviewTool,
+  taskTool,
   bashTool,
   readFileTool,
   writeFileTool,
@@ -26,7 +32,8 @@ export const TOOL_SCHEMAS: ChatFunctionTool[] = registeredTools.map((t) => t.sch
 
 export const TOOLS_BY_NAME: Record<string, Tool> = {
   ...Object.fromEntries(registeredTools.map((t) => [t.name, t])),
-  str_replace: stringReplaceTool
+  str_replace: stringReplaceTool,
+  string_replace: stringReplaceTool
 };
 
 /**
@@ -50,3 +57,5 @@ export * from "./stringReplace.js";
 export * from "./writeTodos.js";
 export * from "./readSkill.js";
 export * from "./browser.js";
+export * from "./task.js";
+export * from "./orchestrator.js";

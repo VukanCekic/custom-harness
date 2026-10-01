@@ -340,6 +340,45 @@ export class UI {
       return this.todos(args.todos);
     }
 
+    if (name === "plan_task") {
+      const header = `${cBold(cAccent("planner"))} ${cMuted(args.goal || this._format_args(args))}`;
+      const resultLines = this._format_result_lines(result);
+      const content = [header, "__DIVIDER__", ...resultLines];
+      const panel = renderPanel(content, {
+        borderColor: cAccent,
+        paddingLeft: nested ? 6 : 2
+      });
+      console.log("\n" + panel);
+      return;
+    }
+
+    if (name === "work_task") {
+      const header = `${cBold(cTool("worker"))} ${cMuted(this._format_args(args))}`;
+      const resultLines = this._format_result_lines(result);
+      const content = [header, "__DIVIDER__", ...resultLines];
+      const panel = renderPanel(content, {
+        borderColor: cTool,
+        paddingLeft: nested ? 6 : 2
+      });
+      console.log("\n" + panel);
+      return;
+    }
+
+    if (name === "review_task") {
+      const isApproved = result.includes("VERDICT: APPROVED");
+      const titleColor = isApproved ? cUser : cTool;
+      const verdictLabel = isApproved ? "reviewer · approved" : "reviewer · changes requested";
+      const header = `${cBold(titleColor(verdictLabel))} ${cMuted(args.goal || this._format_args(args))}`;
+      const resultLines = this._format_result_lines(result);
+      const content = [header, "__DIVIDER__", ...resultLines];
+      const panel = renderPanel(content, {
+        borderColor: titleColor,
+        paddingLeft: nested ? 6 : 2
+      });
+      console.log("\n" + panel);
+      return;
+    }
+
     const formattedArgs = this._format_args(args);
     const header = `${cBold(cTool(name))} ${cMuted(formattedArgs)}`;
 
