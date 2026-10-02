@@ -71,6 +71,7 @@ All settings are environment variables (`.env` works too).
 | `STRIP_AFTER` | `0.25` | Only shrink finished turns once the transcript passes this share of the window (below it, stripping costs more cache than it saves) |
 | `TOOL_CAP` / `TOOL_STUB` | `10000` / `300` | Characters kept of a fresh / a finished tool result |
 | `MAX_STEPS` | `60` | Steps per turn before the agent stops and asks you to say "continue" |
+| `BYPASS_PERMISSIONS` | unset | `1` auto-approves every action that would ask (bash, writes, browser hosts), including in subagents. Hard-deny rules still block, and pipeline mode's bash stays read-only. Use only in a sandbox or throwaway checkout |
 | `SUBAGENT_MAX_TURNS` | `15` | Research subagent turn limit (planner 10, worker 20, reviewer 8) |
 | `SUBAGENT_TIMEOUT_MS` | `600000` | Wall-clock limit per subagent run |
 | `MAX_REWORK` | `2` | Rework cycles allowed per plan after a `changes_requested` review |

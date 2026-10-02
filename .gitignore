@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 test/
+docs/runs/2026-10-02-boids-pipeline-review.md
