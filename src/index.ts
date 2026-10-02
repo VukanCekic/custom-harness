@@ -164,6 +164,12 @@ async function runTurn(promptText: string): Promise<void> {
         restart();
       },
       onApprove: async (reason) => {
+        if (config.bypassPermissions) {
+          pause();
+          ui.note(`auto-approved: ${reason}`);
+          restart();
+          return true;
+        }
         pause();
         const approved = await ui.approve(reason);
         restart();
@@ -420,7 +426,8 @@ async function main() {
 
   ui.banner(sandbox.name(), config.model, [
     `cache: ${usesBreakpoints() ? "anthropic breakpoints" : "provider automatic"}`,
-    mode === "pipeline" ? "mode: pipeline" : null
+    mode === "pipeline" ? "mode: pipeline" : null,
+    config.bypassPermissions ? "permissions: BYPASSED" : null
   ].filter((x): x is string => Boolean(x)));
   ui.history = loadInputHistory();
 

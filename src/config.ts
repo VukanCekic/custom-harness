@@ -108,6 +108,8 @@ export const config = {
   subagentMaxTurns: Number(process.env.SUBAGENT_MAX_TURNS) || 15,
   subagentTimeoutMs: Number(process.env.SUBAGENT_TIMEOUT_MS) || 600_000,
   maxSteps: Number(process.env.MAX_STEPS) || 60,
+  // Auto-approve everything that would ask. Hard-deny rules still apply.
+  bypassPermissions: ["1", "true", "yes"].includes((process.env.BYPASS_PERMISSIONS || "").toLowerCase()),
   maxRework,
   // Send providers' thinking blocks back during tool loops (some require it).
   reasoningRoundTrip: process.env.REASONING_ROUNDTRIP !== "0",
