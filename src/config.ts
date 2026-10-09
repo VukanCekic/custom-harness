@@ -85,19 +85,46 @@ ${skillsText}`.trim();
 const list = (value: string | undefined, fallback: string[]): string[] =>
   value ? value.split(",").map((v) => v.trim()).filter(Boolean) : fallback;
 
+/**
+ * Where the model runs.
+ * "remote": OpenRouter (MODEL, OPENROUTER_API_KEY). The default.
+ * "local": any OpenAI-compatible server - LM Studio, llama-server, Ollama
+ * (LOCAL_MODEL, LOCAL_BASE_URL, LOCAL_API_KEY). Pick with LLM_BACKEND=local or
+ * the --local / --remote flags. Both sets of settings can sit in .env at once.
+ */
+export type Backend = "remote" | "local";
+
+function pickBackend(): Backend {
+  if (process.argv.includes("--local")) return "local";
+  if (process.argv.includes("--remote")) return "remote";
+  const value = (process.env.LLM_BACKEND || "remote").trim().toLowerCase();
+  // A typo must not quietly send a local-model run to a paid API.
+  if (value !== "remote" && value !== "local") {
+    throw new Error(`LLM_BACKEND must be "remote" or "local", got "${process.env.LLM_BACKEND}"`);
+  }
+  return value;
+}
+
+const backend = pickBackend();
+const local = backend === "local";
+
 export const config = {
-  apiKey: process.env.OPENROUTER_API_KEY || "",
-  model: process.env.MODEL || "deepseek/deepseek-v4.1-flash",
+  backend,
+  /** OpenAI-compatible endpoint; empty for the remote backend, which uses the OpenRouter SDK. */
+  baseUrl: local ? (process.env.LOCAL_BASE_URL || "http://localhost:1234/v1").replace(/\/+$/, "") : "",
+  apiKey: local ? process.env.LOCAL_API_KEY || "" : process.env.OPENROUTER_API_KEY || "",
+  model: local ? process.env.LOCAL_MODEL || "qwen3-8b" : process.env.MODEL || "deepseek/deepseek-v4.1-flash",
   get systemPrompt(): string {
     return getSystemPrompt();
   },
   // Routing used to be pinned to Together with fallbacks off, so any MODEL
   // Together does not serve (every Anthropic model, for one) could not run.
   // PROVIDER_ONLY="together" restores the old behaviour.
-  provider: process.env.PROVIDER_ONLY
+  provider: !local && process.env.PROVIDER_ONLY
     ? { only: process.env.PROVIDER_ONLY.split(",").map((p) => p.trim()), allowFallbacks: false }
     : undefined,
-  contextWindow: Number(process.env.CONTEXT_WINDOW) || 64_000,
+  // Set it to what the local server was loaded with (LM Studio: Context Length).
+  contextWindow: Number(process.env.CONTEXT_WINDOW) || (local ? 32_000 : 64_000),
   compactAt: Number(process.env.COMPACT_AT) || 0.85,
   compactTo: Number(process.env.COMPACT_TO) || 0.35,
   // Stripping a finished turn costs one re-prefill of it. Below this share of

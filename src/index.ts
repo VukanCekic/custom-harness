@@ -14,6 +14,7 @@ import { resetPermissions } from "./permissions.js";
 import { resetPipeline } from "./pipeline.js";
 import { settle, sweep, HANDOFF_OPENING } from "./history.js";
 import { usesBreakpoints, type Spend } from "./llm.js";
+import { checkServer } from "./openaiCompat.js";
 import { blame, forget } from "./cache.js";
 import { CancelledError } from "./scope.js";
 import { Session, legacyTranscript, listSessions, load, resumable, sessionDir } from "./session.js";
@@ -249,6 +250,7 @@ async function runTurn(promptText: string): Promise<void> {
     const telemetry = {
       prompt: promptText,
       model: config.model,
+      backend: config.backend,
       mode: result.mode,
       steps: result.steps,
       cancelled: result.cancelled,
@@ -412,8 +414,14 @@ async function command(input: string): Promise<"done" | "exit" | "prompt"> {
 // ------------------------------------------------------------------ main
 
 async function main() {
-  if (!config.apiKey) {
-    ui.note("Error: OPENROUTER_API_KEY is not set in your .env file.");
+  if (config.backend === "local") {
+    const server = await checkServer(config.baseUrl, config.model, config.apiKey);
+    if (!server.ok) {
+      ui.note(`Error: ${server.message}`);
+      process.exit(1);
+    }
+  } else if (!config.apiKey) {
+    ui.note("Error: OPENROUTER_API_KEY is not set in your .env file. (For a local model, use --local.)");
     process.exit(1);
   }
 
@@ -425,7 +433,8 @@ async function main() {
   const cliPrompt = args.filter((a) => !a.startsWith("--")).join(" ").trim();
 
   ui.banner(sandbox.name(), config.model, [
-    `cache: ${usesBreakpoints() ? "anthropic breakpoints" : "provider automatic"}`,
+    config.backend === "local" ? `backend: LOCAL ${config.baseUrl}` : "backend: openrouter",
+    `cache: ${usesBreakpoints() ? "anthropic breakpoints" : config.backend === "local" ? "server prompt cache" : "provider automatic"}`,
     mode === "pipeline" ? "mode: pipeline" : null,
     config.bypassPermissions ? "permissions: BYPASSED" : null
   ].filter((x): x is string => Boolean(x)));

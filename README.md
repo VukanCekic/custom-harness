@@ -28,6 +28,12 @@ Requires Node.js 20.3 or later (CI runs Node 24).
    npm run dev -- "List all TypeScript files in the src directory."
    ```
 
+5. **Or run a local model** (LM Studio, llama-server, Ollama - anything OpenAI-compatible). Start its server, then:
+   ```bash
+   npm run dev -- --local "List all TypeScript files in the src directory."
+   ```
+   See [Remote and local models](#remote-and-local-models).
+
 5. **Resume the last session of this project**:
    ```bash
    npm run dev -- --resume
@@ -57,16 +63,45 @@ Other flags: `--debug` shows raw responses, every late injection and every promp
 - **Ctrl+C** during a turn cancels the turn, not the process. Pending tool calls get a `[cancelled by user]` result, so the transcript stays valid, and running shell commands are killed. A second Ctrl+C quits through a cleanup handler that removes temp files and closes the browser.
 - **Ctrl+D**, or Ctrl+C twice at the prompt, quits.
 
+## Remote and local models
+
+The harness has two backends. **remote** (the default) is OpenRouter. **local** is any server that speaks OpenAI's `/chat/completions` with streaming and tool calls. The banner, the session log and every run record say which one ran.
+
+| | remote | local |
+|---|---|---|
+| Pick | default, or `--remote` | `--local`, or `LLM_BACKEND=local` |
+| Model | `MODEL` | `LOCAL_MODEL` (default `qwen3-8b`) |
+| Endpoint | OpenRouter | `LOCAL_BASE_URL` (default `http://localhost:1234/v1`, LM Studio's) |
+| Key | `OPENROUTER_API_KEY` | `LOCAL_API_KEY` (optional) |
+| Cost | from OpenRouter | always `$0` - local servers send no price |
+
+Both sets of variables can live in `.env` together; the flag or `LLM_BACKEND` chooses. The flags beat the variable, and an unknown `LLM_BACKEND` is an error, never a silent fall back to the paid API.
+
+```bash
+npm run dev -- --local "prompt"                      # flag
+LLM_BACKEND=local npm run dev -- "prompt"            # variable (bash)
+npm run dev -- --remote "prompt"                     # force OpenRouter
+```
+
+Local setup notes:
+- Set `CONTEXT_WINDOW` to the context length the model was loaded with (LM Studio: *Context Length*); the local default is `32000`.
+- On start the harness checks `/models` and says so if the server is down or the model id is unknown.
+- Qwen3 "thinks" first. LM Studio and llama-server send that in a separate `reasoning_content` field; the harness counts it for timing, never shows it as the answer and never sends it back.
+- `REASONING_ROUNDTRIP` and cache breakpoints are OpenRouter features and are never sent to a local server.
+- Wire formats seen so far, with captured responses: [`docs/local-backend-wire-format.md`](docs/local-backend-wire-format.md).
+
 ## Configuration
 
 All settings are environment variables (`.env` works too).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENROUTER_API_KEY` | — | Required |
+| `LLM_BACKEND` | `remote` | `remote` (OpenRouter) or `local` (OpenAI-compatible server); `--local` / `--remote` override it. See [above](#remote-and-local-models) |
+| `OPENROUTER_API_KEY` | — | Required for the remote backend |
+| `LOCAL_MODEL` / `LOCAL_BASE_URL` / `LOCAL_API_KEY` | `qwen3-8b` / `http://localhost:1234/v1` / unset | The local backend's model id, endpoint and optional key |
 | `MODEL` | `deepseek/deepseek-v4.1-flash` | Any OpenRouter model id. `anthropic/*` models get explicit cache breakpoints |
 | `PROVIDER_ONLY` | unset | Comma-separated provider list with fallbacks off, e.g. `together`. Unset = OpenRouter's default routing |
-| `CONTEXT_WINDOW` | `64000` | Token budget the harness manages to |
+| `CONTEXT_WINDOW` | `64000` (`32000` local) | Token budget the harness manages to. Match the local server's loaded context length |
 | `COMPACT_AT` / `COMPACT_TO` | `0.85` / `0.35` | Compact when a request passes this share of the window; keep this share verbatim |
 | `STRIP_AFTER` | `0.25` | Only shrink finished turns once the transcript passes this share of the window (below it, stripping costs more cache than it saves) |
 | `TOOL_CAP` / `TOOL_STUB` | `10000` / `300` | Characters kept of a fresh / a finished tool result |

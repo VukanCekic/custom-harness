@@ -20,7 +20,7 @@ import { config } from "./config.js";
 import { HANDOFF_OPENING } from "./history.js";
 
 export type SessionRecord =
-  | { type: "meta"; version: 1; id: string; cwd: string; model: string; created: string }
+  | { type: "meta"; version: 1; id: string; cwd: string; model: string; backend?: string; created: string }
   | { type: "message"; message: ChatMessages }
   | { type: "replace"; reason: string; messages: ChatMessages[] }
   | { type: "rewind"; keep: number }
@@ -143,7 +143,7 @@ export class Session {
     fs.mkdirSync(dir, { recursive: true });
     const id = stamp();
     const session = new Session(path.join(dir, `${id}.jsonl`), 0);
-    session.append({ type: "meta", version: 1, id, cwd: process.cwd(), model: config.model, created: new Date().toISOString() });
+    session.append({ type: "meta", version: 1, id, cwd: process.cwd(), model: config.model, backend: config.backend, created: new Date().toISOString() });
     return session;
   }
 

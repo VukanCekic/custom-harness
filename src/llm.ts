@@ -7,11 +7,12 @@ import type {
 } from "@openrouter/sdk/models";
 import { config } from "./config.js";
 import { locked } from "./history.js";
+import { openaiStream, type StreamChunk } from "./openaiCompat.js";
 import { CancelledError, current, type Role } from "./scope.js";
 
-const openrouter = new OpenRouter({
-  apiKey: config.apiKey
-});
+// Built on first use: the local backend has no OpenRouter key and never needs one.
+let client: OpenRouter | undefined;
+const openrouter = (): OpenRouter => (client ??= new OpenRouter({ apiKey: config.apiKey }));
 
 // The SDK default retries 5XX only - for up to an hour, with no request
 // timeout - and never retries 429. Bounded, and rate limits included; the SDK
@@ -172,9 +173,12 @@ const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || undefined;
 
 const EPHEMERAL = { type: "ephemeral" as const };
 
-/** Anthropic caches only up to an explicit breakpoint; other providers cache on their own. */
+/**
+ * Anthropic caches only up to an explicit breakpoint; other providers cache on
+ * their own. Breakpoints are an OpenRouter extension, so never on the local backend.
+ */
 export function usesBreakpoints(model = config.model): boolean {
-  return model.startsWith("anthropic/");
+  return config.backend === "remote" && model.startsWith("anthropic/");
 }
 
 function marked(message: ChatMessages): ChatMessages {
@@ -299,23 +303,39 @@ export async function callLLM(
     : { messages, tools: tools ?? undefined };
 
   try {
-    const stream = await openrouter.chat.send(
-      {
-        chatRequest: {
+    let stream: AsyncIterable<StreamChunk>;
+    if (config.backend === "local") {
+      stream = await openaiStream(
+        {
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
           model: config.model,
           messages: request.messages,
           tools: request.tools,
-          stream: true,
-          provider: config.provider,
-          ...(opts.toolChoice && request.tools ? { toolChoice: opts.toolChoice } : {}),
-          ...(MAX_OUTPUT_TOKENS ? { maxTokens: MAX_OUTPUT_TOKENS } : {})
-        }
-      },
-      { ...RETRY, signal: abort }
-    );
-
-    if (!(Symbol.asyncIterator in stream)) {
-      throw new Error("Expected a stream response from OpenRouter.");
+          toolChoice: opts.toolChoice,
+          maxTokens: MAX_OUTPUT_TOKENS
+        },
+        abort
+      );
+    } else {
+      const response = await openrouter().chat.send(
+        {
+          chatRequest: {
+            model: config.model,
+            messages: request.messages,
+            tools: request.tools,
+            stream: true,
+            provider: config.provider,
+            ...(opts.toolChoice && request.tools ? { toolChoice: opts.toolChoice } : {}),
+            ...(MAX_OUTPUT_TOKENS ? { maxTokens: MAX_OUTPUT_TOKENS } : {})
+          }
+        },
+        { ...RETRY, signal: abort }
+      );
+      if (!(Symbol.asyncIterator in response)) {
+        throw new Error("Expected a stream response from OpenRouter.");
+      }
+      stream = response as AsyncIterable<StreamChunk>;
     }
 
     for await (const chunk of stream) {
