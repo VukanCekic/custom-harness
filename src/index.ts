@@ -129,7 +129,8 @@ function adopt(messages: ChatMessages[]): ChatMessages[] {
 
 // ------------------------------------------------------------------ one turn
 
-async function runTurn(promptText: string): Promise<void> {
+/** False when the turn ended in an error (provider down, context overflow, ...) rather than finishing or being cancelled. */
+async function runTurn(promptText: string): Promise<boolean> {
   ui.user(promptText);
 
   let spinner = ui.working(`${activeForm()}...`);
@@ -221,6 +222,13 @@ async function runTurn(promptText: string): Promise<void> {
         ui.note(text);
         restart();
       },
+      onStepRecord: (stepRecord) => {
+        try {
+          session.step({ ...stepRecord });
+        } catch {
+          // the log is best-effort; the turn carries on
+        }
+      },
       onStepEnd: (_step, usage) => {
         if (usage) {
           pause();
@@ -254,6 +262,7 @@ async function runTurn(promptText: string): Promise<void> {
       mode: result.mode,
       steps: result.steps,
       cancelled: result.cancelled,
+      stop_reason: result.stopReason,
       cost: result.totalCost,
       cost_by_role: result.costByRole,
       cache_hit_rate: result.cacheHitRate,
@@ -277,9 +286,19 @@ async function runTurn(promptText: string): Promise<void> {
     } catch (err: any) {
       ui.note(`Failed to save run details: ${err.message}`);
     }
+    return true;
   } catch (err: any) {
     pause();
-    ui.note(`Execution error: ${err.message || String(err)}`);
+    const message = err.message || String(err);
+    ui.note(`Execution error: ${message}`);
+    // The turn record is also how a log says "this turn failed": one that is
+    // missing means the process was killed, one with `error` means it gave up.
+    try {
+      session.turn({ prompt: promptText, model: config.model, backend: config.backend, error: { name: String(err?.name ?? "Error"), message } });
+    } catch {
+      // the log is best-effort here; the exit code still says it failed
+    }
+    return false;
   } finally {
     turn = null;
   }
@@ -467,7 +486,9 @@ async function main() {
 
   try {
     if (cliPrompt) {
-      await runTurn(cliPrompt);
+      const ok = await runTurn(cliPrompt);
+      // A script or an eval must be able to tell a failed turn from a finished one.
+      if (!ok) process.exitCode = 3;
       return;
     }
 
@@ -493,7 +514,14 @@ async function main() {
 }
 
 main()
-  .then(() => process.exit(0))
+  .then(() => {
+    // Not process.exit(): on Windows, exiting while a finished fetch's socket is
+    // still closing trips a libuv assertion and the exit code becomes 0xC0000409 -
+    // a good run reported as a crash. Let the loop drain; the unref'd timer only
+    // matters if some handle keeps it alive.
+    process.exitCode ??= 0;
+    setTimeout(() => process.exit(process.exitCode ?? 0), 3_000).unref();
+  })
   .catch(async (err) => {
     await closeBrowser();
     console.error("\nFatal error:", err);

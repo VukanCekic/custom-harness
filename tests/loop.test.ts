@@ -20,6 +20,8 @@ process.env.OPENROUTER_API_KEY = "sk-or-mock-never-sent";
 process.env.SESSION_DIR = path.join(WORK, "..", `${path.basename(WORK)}-sessions`);
 process.env.SUBAGENT_TIMEOUT_MS = "1500";
 process.env.STRIP_AFTER = "0"; // strip every turn, so the cache telemetry has something to report
+const WIRE = path.join(WORK, "..", `${path.basename(WORK)}-wire.jsonl`);
+process.env.WIRE_LOG = WIRE;
 delete process.env.MODEL;
 delete process.env.PROVIDER_ONLY;
 
@@ -258,4 +260,97 @@ test("the agent's own writes are not reported back as outside changes", async ()
 
 test("the ledger counts every call", () => {
   assert.ok(ledger.calls >= mock.requests.length);
+});
+
+const askBash = (n = 1) => (body: any) => (roleOf(body) === "main" && toolCallsSoFar(body) < n ? { toolCalls: [tc("bash", { command: "echo hi" })] } : { content: "done" });
+/** Tool results already in a request: how many tool rounds the main loop has done. */
+const toolCallsSoFar = (body: any): number => (body.messages || []).filter((m: any) => m.role === "tool").length;
+
+test("every main-loop call leaves a step record, and the turn says why it stopped", async () => {
+  mock.setScript(askBash(1));
+  const records: any[] = [];
+  const result = await runAgent("say hi", { onStepRecord: (r) => records.push(r), onApprove: async () => true });
+
+  assert.equal(result.stopReason, "done");
+  assert.deepEqual(records.map((r) => [r.step, r.finish_reason, r.tool_calls]), [[1, "tool_calls", ["bash"]], [2, "stop", []]]);
+  assert.equal(records[0].completion_tokens, 50);
+  assert.ok(records[0].total_time_ms >= 0 && !Number.isNaN(Date.parse(records[0].at)), "timestamped");
+  assert.deepEqual(result.stepUsage, records, "the end-of-turn record repeats them");
+});
+
+test("the loop stops with a reason when it runs out of steps or of tokens", async () => {
+  mock.setScript((body) => (roleOf(body) === "main" ? { toolCalls: [tc("bash", { command: "echo hi" })] } : { content: "x" }));
+
+  const steps = await runAgent("loop forever", { maxSteps: 2, onApprove: async () => true });
+  assert.equal(steps.stopReason, "max_steps");
+  assert.equal(steps.steps, 2);
+  assert.match(steps.finalResponse, /stopped after 2 steps/);
+
+  const saved = config.maxTurnTokens;
+  config.maxTurnTokens = 100; // the mock generates 50 completion tokens per call
+  try {
+    const tokens = await runAgent("loop forever", { onApprove: async () => true });
+    assert.equal(tokens.stopReason, "token_budget");
+    assert.equal(tokens.steps, 2, "two calls reach 100 tokens; the third is not made");
+    assert.match(tokens.finalResponse, /MAX_TURN_TOKENS=100/);
+  } finally {
+    config.maxTurnTokens = saved;
+  }
+});
+
+test("the session log says which settings it was produced with, and keeps step records out of the transcript", () => {
+  const session = Session.create();
+  session.step({ step: 1, finish_reason: "stop" });
+  const lines = fs.readFileSync(session.file, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.deepEqual(lines.map((l) => l.type), ["meta", "step"]);
+  assert.equal(lines[0].settings.backend, "remote");
+  assert.ok("sampling" in lines[0].settings && "thinking" in lines[0].settings && "max_output_tokens" in lines[0].settings);
+  assert.equal(load(session.file).messages.length, 0, "a step record is not a message");
+});
+
+test("remote: sampling and max_tokens are sent when set and left out when not", async () => {
+  mock.setScript(() => ({ content: "ok" }));
+  const saved = { sampling: config.sampling, maxOutputTokens: config.maxOutputTokens };
+  try {
+    mock.reset();
+    await runAgent("hi", { onApprove: async () => true });
+    for (const field of ["temperature", "top_p", "top_k", "presence_penalty", "seed", "max_tokens"]) {
+      assert.ok(!(field in mock.requests[0]), `${field} is not sent unless set`);
+    }
+
+    mock.reset();
+    config.sampling = { temperature: 0.6, topP: 0.95, topK: 20, presencePenalty: 1.5, seed: 7 };
+    config.maxOutputTokens = 8192;
+    await runAgent("hi again", { onApprove: async () => true });
+    const body = mock.requests[0];
+    assert.deepEqual(
+      [body.temperature, body.top_p, body.top_k, body.presence_penalty, body.seed, body.max_tokens],
+      [0.6, 0.95, 20, 1.5, 7, 8192]
+    );
+  } finally {
+    Object.assign(config, saved);
+  }
+});
+
+test("the wire log has one record per model call, subagents included, with what was sent and what came back", async () => {
+  fs.rmSync(WIRE, { force: true });
+  mock.setScript((body) => {
+    const role = roleOf(body);
+    if (role === "researcher") return { content: "found it", reasoningDetails: [{ type: "reasoning.text", text: "hmm" }] };
+    if (role === "main" && toolCallsSoFar(body) === 0) return { toolCalls: [tc("task", { description: "where is the bug?" })] };
+    return { content: "done" };
+  });
+  await runAgent("find the bug", { onApprove: async () => true });
+
+  const calls = fs.readFileSync(WIRE, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+  assert.equal(calls.length, mock.requests.length, "every request has a record");
+  assert.deepEqual(calls.map((c) => c.role).sort(), ["main", "main", "researcher"]);
+  const main = calls.find((c) => c.role === "main");
+  assert.equal(main.request.messages[0].role, "system");
+  assert.ok(main.request.messages.some((m: any) => typeof m.content === "string" && m.content.startsWith("<env>")), "the late reminder is in the request, as the model saw it");
+  assert.ok(main.request.tools.some((t: any) => t.function.name === "bash"));
+  assert.equal(main.response.finish_reason, "tool_calls");
+  assert.equal(main.response.tool_calls[0].function.name, "task");
+  assert.equal(main.response.usage.completion_tokens, 50);
+  assert.equal(calls.find((c) => c.role === "researcher").response.content, "found it");
 });

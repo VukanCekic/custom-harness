@@ -16,15 +16,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChatMessages } from "@openrouter/sdk/models";
-import { config } from "./config.js";
+import { config, describeSettings } from "./config.js";
 import { HANDOFF_OPENING } from "./history.js";
 
 export type SessionRecord =
-  | { type: "meta"; version: 1; id: string; cwd: string; model: string; backend?: string; created: string }
+  | { type: "meta"; version: 1; id: string; cwd: string; model: string; backend?: string; created: string; settings?: unknown }
   | { type: "message"; message: ChatMessages }
   | { type: "replace"; reason: string; messages: ChatMessages[] }
   | { type: "rewind"; keep: number }
-  | { type: "turn"; [key: string]: unknown };
+  | { type: "turn"; [key: string]: unknown }
+  | { type: "step"; [key: string]: unknown };
 
 /** This project's session directory. */
 export function sessionDir(cwd = process.cwd()): string {
@@ -143,7 +144,16 @@ export class Session {
     fs.mkdirSync(dir, { recursive: true });
     const id = stamp();
     const session = new Session(path.join(dir, `${id}.jsonl`), 0);
-    session.append({ type: "meta", version: 1, id, cwd: process.cwd(), model: config.model, backend: config.backend, created: new Date().toISOString() });
+    session.append({
+      type: "meta",
+      version: 1,
+      id,
+      cwd: process.cwd(),
+      model: config.model,
+      backend: config.backend,
+      created: new Date().toISOString(),
+      settings: describeSettings()
+    });
     return session;
   }
 
@@ -186,6 +196,14 @@ export class Session {
   rewind(keep: number): void {
     this.append({ type: "rewind", keep });
     this.written = keep;
+  }
+
+  /**
+   * One main-loop model call, written as soon as it returns: a run that is
+   * killed later still has its usage, timing and finish reasons up to then.
+   */
+  step(data: Record<string, unknown>): void {
+    this.append({ type: "step", ...data });
   }
 
   /** End-of-turn telemetry: usage per step, cache, compactions, cost by role. */

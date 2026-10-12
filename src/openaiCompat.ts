@@ -11,6 +11,7 @@
  * fragments, usage in a last chunk whose `choices` is empty, no cost.
  */
 import type { ChatMessages, ChatFunctionTool, ChatUsage } from "@openrouter/sdk/models";
+import type { Sampling } from "./config.js";
 
 // ------------------------------------------------------------------ chunks
 
@@ -143,6 +144,8 @@ const DONE = Symbol("done");
 
 // ---------------------------------------------------------------- messages
 
+export const NO_THINK = "\n\n/no_think";
+
 const text = (content: unknown): string => {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -153,7 +156,8 @@ const text = (content: unknown): string => {
  * Internal (camelCase) transcript -> OpenAI wire messages. Thinking blocks and
  * cache markers are OpenRouter's; a local server has no use for either.
  */
-export function toWireMessages(messages: ChatMessages[]): Array<Record<string, unknown>> {
+export function toWireMessages(messages: ChatMessages[], options: { noThink?: boolean } = {}): Array<Record<string, unknown>> {
+  let softSwitchSent = false;
   return messages.map((message: any) => {
     switch (message.role) {
       case "assistant": {
@@ -175,6 +179,13 @@ export function toWireMessages(messages: ChatMessages[]): Array<Record<string, u
       }
       case "tool":
         return { role: "tool", tool_call_id: message.toolCallId, content: text(message.content) };
+      case "system": {
+        // Qwen3's documented soft switch: "/no_think" in the system prompt or a user turn. Added on
+        // the wire only, to the first system message, so the transcript and its cache prefix are unchanged.
+        const suffix = options.noThink && !softSwitchSent ? NO_THINK : "";
+        softSwitchSent ||= Boolean(suffix);
+        return { role: "system", content: text(message.content) + suffix };
+      }
       default:
         return { role: message.role, content: text(message.content) };
     }
@@ -191,6 +202,36 @@ export interface LocalRequest {
   tools?: ChatFunctionTool[];
   toolChoice?: "auto" | "required" | "none";
   maxTokens?: number;
+  /** Sent as the OpenAI field names; LM Studio documents temperature, top_p, top_k, presence_penalty, seed and max_tokens. */
+  sampling?: Sampling;
+  /** "off" adds Qwen3's /no_think soft switch to the system message. */
+  thinking?: "default" | "off";
+}
+
+/** Sampling in the OpenAI wire's snake_case, leaving out what is not set. */
+export function samplingFields(sampling: Sampling = {}): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (sampling.temperature !== undefined) out.temperature = sampling.temperature;
+  if (sampling.topP !== undefined) out.top_p = sampling.topP;
+  if (sampling.topK !== undefined) out.top_k = sampling.topK;
+  if (sampling.presencePenalty !== undefined) out.presence_penalty = sampling.presencePenalty;
+  if (sampling.seed !== undefined) out.seed = sampling.seed;
+  return out;
+}
+
+/** The JSON body of a /chat/completions request. */
+export function requestBody(request: LocalRequest): Record<string, unknown> {
+  return {
+    model: request.model,
+    messages: toWireMessages(request.messages, { noThink: request.thinking === "off" }),
+    ...samplingFields(request.sampling),
+    stream: true,
+    stream_options: { include_usage: true },
+    ...(request.tools && request.tools.length > 0 ? { tools: request.tools } : {}),
+    // Ollama ignores tool_choice, LM Studio and llama-server honour it.
+    ...(request.toolChoice && request.tools?.length ? { tool_choice: request.toolChoice } : {}),
+    ...(request.maxTokens ? { max_tokens: request.maxTokens } : {})
+  };
 }
 
 /** Retry only what is worth retrying, and only before the first byte. A dead local server fails in seconds. */
@@ -217,16 +258,7 @@ async function errorMessage(response: Response): Promise<string> {
 
 /** POST /chat/completions with streaming; resolves once the server has started answering. */
 export async function openaiStream(request: LocalRequest, signal: AbortSignal): Promise<AsyncGenerator<StreamChunk>> {
-  const body = {
-    model: request.model,
-    messages: toWireMessages(request.messages),
-    stream: true,
-    stream_options: { include_usage: true },
-    ...(request.tools && request.tools.length > 0 ? { tools: request.tools } : {}),
-    // Ollama ignores tool_choice, LM Studio and llama-server honour it.
-    ...(request.toolChoice && request.tools?.length ? { tool_choice: request.toolChoice } : {}),
-    ...(request.maxTokens ? { max_tokens: request.maxTokens } : {})
-  };
+  const body = requestBody(request);
   const init: RequestInit = {
     method: "POST",
     headers: {

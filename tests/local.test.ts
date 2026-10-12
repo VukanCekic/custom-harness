@@ -164,3 +164,32 @@ test("checkServer: says what to do when the server is down, the key is wrong or 
     globalThis.fetch = mockFetch;
   }
 });
+
+test("sampling, max_tokens and the thinking switch reach the wire; what is not set is left out", async () => {
+  mock.setScript(() => ({ content: "ok" }));
+  const messages = [{ role: "system" as const, content: "sys" }, { role: "user" as const, content: "hi" }];
+  const saved = { sampling: config.sampling, thinking: config.thinking, maxOutputTokens: config.maxOutputTokens };
+  try {
+    await callLLM(messages, null);
+    for (const field of ["temperature", "top_p", "top_k", "presence_penalty", "seed", "max_tokens"]) {
+      assert.ok(!(field in mock.requests[0]), `${field} is not sent unless set`);
+    }
+    assert.equal(mock.requests[0].messages[0].content, "sys");
+
+    mock.reset();
+    config.sampling = { temperature: 0.6, topP: 0.95, topK: 20, presencePenalty: 1.5, seed: 7 };
+    config.thinking = "off";
+    config.maxOutputTokens = 8192;
+    await callLLM(messages, null);
+    const body = mock.requests[0];
+    assert.deepEqual(
+      [body.temperature, body.top_p, body.top_k, body.presence_penalty, body.seed, body.max_tokens],
+      [0.6, 0.95, 20, 1.5, 7, 8192]
+    );
+    assert.equal(body.messages[0].content, "sys\n\n/no_think", "Qwen3's soft switch, on the first system message only");
+    assert.equal(body.messages[1].content, "hi");
+    assert.equal(messages[0].content, "sys", "the transcript itself is not touched");
+  } finally {
+    Object.assign(config, saved);
+  }
+});
