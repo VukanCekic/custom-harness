@@ -85,19 +85,92 @@ ${skillsText}`.trim();
 const list = (value: string | undefined, fallback: string[]): string[] =>
   value ? value.split(",").map((v) => v.trim()).filter(Boolean) : fallback;
 
+/**
+ * Where the model runs.
+ * "remote": OpenRouter (MODEL, OPENROUTER_API_KEY). The default.
+ * "local": any OpenAI-compatible server - LM Studio, llama-server, Ollama
+ * (LOCAL_MODEL, LOCAL_BASE_URL, LOCAL_API_KEY). Pick with LLM_BACKEND=local or
+ * the --local / --remote flags. Both sets of settings can sit in .env at once.
+ */
+export type Backend = "remote" | "local";
+
+function pickBackend(): Backend {
+  if (process.argv.includes("--local")) return "local";
+  if (process.argv.includes("--remote")) return "remote";
+  const value = (process.env.LLM_BACKEND || "remote").trim().toLowerCase();
+  // A typo must not quietly send a local-model run to a paid API.
+  if (value !== "remote" && value !== "local") {
+    throw new Error(`LLM_BACKEND must be "remote" or "local", got "${process.env.LLM_BACKEND}"`);
+  }
+  return value;
+}
+
+const backend = pickBackend();
+const local = backend === "local";
+
+/**
+ * A number from the environment, or undefined when unset. A typo throws: a
+ * sampling or budget setting that is silently ignored changes what a run
+ * measures without leaving a trace.
+ */
+function envNumber(name: string, { min, max, integer }: { min?: number; max?: number; integer?: boolean } = {}): number | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const value = Number(raw);
+  const bad =
+    !Number.isFinite(value) ||
+    (integer && !Number.isInteger(value)) ||
+    (min !== undefined && value < min) ||
+    (max !== undefined && value > max);
+  if (bad) {
+    const range = [min !== undefined ? `>= ${min}` : "", max !== undefined ? `<= ${max}` : ""].filter(Boolean).join(" and ");
+    throw new Error(`${name} must be ${integer ? "an integer" : "a number"}${range ? ` ${range}` : ""}, got "${raw}"`);
+  }
+  return value;
+}
+
+/** What to send beside the messages. Unset means the server's or provider's own default - which is not recorded anywhere. */
+export interface Sampling {
+  temperature?: number;
+  topP?: number;
+  topK?: number;
+  presencePenalty?: number;
+  seed?: number;
+}
+
+const sampling: Sampling = {
+  temperature: envNumber("LLM_TEMPERATURE", { min: 0, max: 2 }),
+  topP: envNumber("LLM_TOP_P", { min: 0, max: 1 }),
+  topK: envNumber("LLM_TOP_K", { min: 0, integer: true }),
+  presencePenalty: envNumber("LLM_PRESENCE_PENALTY", { min: -2, max: 2 }),
+  seed: envNumber("LLM_SEED", { integer: true })
+};
+
+/** "off" asks a Qwen3 model to skip its thinking (the documented /no_think soft switch). Local backend only. */
+function pickThinking(): "default" | "off" {
+  const value = (process.env.LOCAL_THINKING || "default").trim().toLowerCase();
+  if (value !== "default" && value !== "off") throw new Error(`LOCAL_THINKING must be "default" or "off", got "${process.env.LOCAL_THINKING}"`);
+  // Like LOCAL_MODEL it may sit in .env beside the remote settings; only the local backend uses it.
+  return local ? value : "default";
+}
+
 export const config = {
-  apiKey: process.env.OPENROUTER_API_KEY || "",
-  model: process.env.MODEL || "deepseek/deepseek-v4.1-flash",
+  backend,
+  /** OpenAI-compatible endpoint; empty for the remote backend, which uses the OpenRouter SDK. */
+  baseUrl: local ? (process.env.LOCAL_BASE_URL || "http://localhost:1234/v1").replace(/\/+$/, "") : "",
+  apiKey: local ? process.env.LOCAL_API_KEY || "" : process.env.OPENROUTER_API_KEY || "",
+  model: local ? process.env.LOCAL_MODEL || "qwen3-8b" : process.env.MODEL || "deepseek/deepseek-v4.1-flash",
   get systemPrompt(): string {
     return getSystemPrompt();
   },
   // Routing used to be pinned to Together with fallbacks off, so any MODEL
   // Together does not serve (every Anthropic model, for one) could not run.
   // PROVIDER_ONLY="together" restores the old behaviour.
-  provider: process.env.PROVIDER_ONLY
+  provider: !local && process.env.PROVIDER_ONLY
     ? { only: process.env.PROVIDER_ONLY.split(",").map((p) => p.trim()), allowFallbacks: false }
     : undefined,
-  contextWindow: Number(process.env.CONTEXT_WINDOW) || 64_000,
+  // Set it to what the local server was loaded with (LM Studio: Context Length).
+  contextWindow: Number(process.env.CONTEXT_WINDOW) || (local ? 32_000 : 64_000),
   compactAt: Number(process.env.COMPACT_AT) || 0.85,
   compactTo: Number(process.env.COMPACT_TO) || 0.35,
   // Stripping a finished turn costs one re-prefill of it. Below this share of
@@ -108,6 +181,12 @@ export const config = {
   subagentMaxTurns: Number(process.env.SUBAGENT_MAX_TURNS) || 15,
   subagentTimeoutMs: Number(process.env.SUBAGENT_TIMEOUT_MS) || 600_000,
   maxSteps: Number(process.env.MAX_STEPS) || 60,
+  sampling,
+  thinking: pickThinking(),
+  /** Per request. Without it one generation can run until the context is full. */
+  maxOutputTokens: envNumber("MAX_OUTPUT_TOKENS", { min: 0, integer: true }) || undefined,
+  /** Completion tokens the whole turn may generate (main loop, subagents, compaction). The loop stops before the next step once it is over. */
+  maxTurnTokens: envNumber("MAX_TURN_TOKENS", { min: 0, integer: true }) || undefined,
   // Auto-approve everything that would ask. Hard-deny rules still apply.
   bypassPermissions: ["1", "true", "yes"].includes((process.env.BYPASS_PERMISSIONS || "").toLowerCase()),
   maxRework,
@@ -118,3 +197,23 @@ export const config = {
   // Session logs live here, never inside the project being worked on.
   sessionDir: process.env.SESSION_DIR || ""
 };
+
+/**
+ * The settings that decide what a run measures, as they were in effect. Written
+ * into the session log's first record, so a log says how it was produced.
+ */
+export function describeSettings() {
+  return {
+    backend: config.backend,
+    model: config.model,
+    base_url: config.baseUrl || undefined,
+    sampling: config.sampling,
+    thinking: config.thinking,
+    max_output_tokens: config.maxOutputTokens ?? null,
+    max_turn_tokens: config.maxTurnTokens ?? null,
+    max_steps: config.maxSteps,
+    context_window: config.contextWindow,
+    provider: config.provider ?? null,
+    reasoning_roundtrip: config.reasoningRoundTrip
+  };
+}

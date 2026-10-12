@@ -28,6 +28,12 @@ Requires Node.js 20.3 or later (CI runs Node 24).
    npm run dev -- "List all TypeScript files in the src directory."
    ```
 
+5. **Or run a local model** (LM Studio, llama-server, Ollama - anything OpenAI-compatible). Start its server, then:
+   ```bash
+   npm run dev -- --local "List all TypeScript files in the src directory."
+   ```
+   See [Remote and local models](#remote-and-local-models).
+
 5. **Resume the last session of this project**:
    ```bash
    npm run dev -- --resume
@@ -57,20 +63,54 @@ Other flags: `--debug` shows raw responses, every late injection and every promp
 - **Ctrl+C** during a turn cancels the turn, not the process. Pending tool calls get a `[cancelled by user]` result, so the transcript stays valid, and running shell commands are killed. A second Ctrl+C quits through a cleanup handler that removes temp files and closes the browser.
 - **Ctrl+D**, or Ctrl+C twice at the prompt, quits.
 
+## Remote and local models
+
+The harness has two backends. **remote** (the default) is OpenRouter. **local** is any server that speaks OpenAI's `/chat/completions` with streaming and tool calls. The banner, the session log and every run record say which one ran.
+
+| | remote | local |
+|---|---|---|
+| Pick | default, or `--remote` | `--local`, or `LLM_BACKEND=local` |
+| Model | `MODEL` | `LOCAL_MODEL` (default `qwen3-8b`) |
+| Endpoint | OpenRouter | `LOCAL_BASE_URL` (default `http://localhost:1234/v1`, LM Studio's) |
+| Key | `OPENROUTER_API_KEY` | `LOCAL_API_KEY` (optional) |
+| Cost | from OpenRouter | always `$0` - local servers send no price |
+
+Both sets of variables can live in `.env` together; the flag or `LLM_BACKEND` chooses. The flags beat the variable, and an unknown `LLM_BACKEND` is an error, never a silent fall back to the paid API.
+
+```bash
+npm run dev -- --local "prompt"                      # flag
+LLM_BACKEND=local npm run dev -- "prompt"            # variable (bash)
+npm run dev -- --remote "prompt"                     # force OpenRouter
+```
+
+Local setup notes:
+- Set `CONTEXT_WINDOW` to the context length the model was loaded with (LM Studio: *Context Length*); the local default is `32000`.
+- On start the harness checks `/models` and says so if the server is down or the model id is unknown.
+- Qwen3 "thinks" first. LM Studio and llama-server send that in a separate `reasoning_content` field; the harness counts it for timing, never shows it as the answer and never sends it back.
+- `REASONING_ROUNDTRIP` and cache breakpoints are OpenRouter features and are never sent to a local server.
+- Wire formats seen so far, with captured responses: [`docs/local-backend-wire-format.md`](docs/local-backend-wire-format.md).
+
 ## Configuration
 
 All settings are environment variables (`.env` works too).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `OPENROUTER_API_KEY` | — | Required |
+| `LLM_BACKEND` | `remote` | `remote` (OpenRouter) or `local` (OpenAI-compatible server); `--local` / `--remote` override it. See [above](#remote-and-local-models) |
+| `OPENROUTER_API_KEY` | — | Required for the remote backend |
+| `LOCAL_MODEL` / `LOCAL_BASE_URL` / `LOCAL_API_KEY` | `qwen3-8b` / `http://localhost:1234/v1` / unset | The local backend's model id, endpoint and optional key |
 | `MODEL` | `deepseek/deepseek-v4.1-flash` | Any OpenRouter model id. `anthropic/*` models get explicit cache breakpoints |
 | `PROVIDER_ONLY` | unset | Comma-separated provider list with fallbacks off, e.g. `together`. Unset = OpenRouter's default routing |
-| `CONTEXT_WINDOW` | `64000` | Token budget the harness manages to |
+| `CONTEXT_WINDOW` | `64000` (`32000` local) | Token budget the harness manages to. Match the local server's loaded context length |
 | `COMPACT_AT` / `COMPACT_TO` | `0.85` / `0.35` | Compact when a request passes this share of the window; keep this share verbatim |
 | `STRIP_AFTER` | `0.25` | Only shrink finished turns once the transcript passes this share of the window (below it, stripping costs more cache than it saves) |
 | `TOOL_CAP` / `TOOL_STUB` | `10000` / `300` | Characters kept of a fresh / a finished tool result |
 | `MAX_STEPS` | `60` | Steps per turn before the agent stops and asks you to say "continue" |
+| `MAX_OUTPUT_TOKENS` | unset | Cap on one model reply (`max_tokens`). Without it a single generation can run until the context is full |
+| `MAX_TURN_TOKENS` | unset | Completion tokens one turn may generate in total (main loop, subagents, compaction). Checked between steps; the turn ends with stop reason `token_budget` |
+| `LLM_TEMPERATURE`, `LLM_TOP_P`, `LLM_TOP_K`, `LLM_PRESENCE_PENALTY`, `LLM_SEED` | unset | Sampling, sent to both backends. **Unset means the server's or provider's own default, which nothing records**: pin them for anything you want to compare. A malformed value stops the start-up |
+| `LOCAL_THINKING` | `default` | `off` appends Qwen3's `/no_think` soft switch to the first system message on the wire (ignored by the remote backend). The transcript is unchanged |
+| `WIRE_LOG` | unset | Append one JSON line per model call to this file: the messages as the harness holds them (late reminder included; the `/no_think` suffix is added afterwards, on the wire, and `thinking` records that it was on), the tools and sampling sent, and the content, thinking, tool calls, finish reason and usage that came back. Main loop, subagents and compaction all log, each with its `role` |
 | `BYPASS_PERMISSIONS` | unset | `1` auto-approves every action that would ask (bash, writes, browser hosts), including in subagents. Hard-deny rules still block, and pipeline mode's bash stays read-only. Use only in a sandbox or throwaway checkout |
 | `SUBAGENT_MAX_TURNS` | `15` | Research subagent turn limit (planner 10, worker 20, reviewer 8) |
 | `SUBAGENT_TIMEOUT_MS` | `600000` | Wall-clock limit per subagent run |
@@ -98,7 +138,13 @@ Each step:
 4. **Call the model**, streaming. Tool calls run through the shared gate (below). The fresh results are capped, keeping head and tail, with the full text spilled to a temp file.
 5. At the end of the turn, if the transcript is big enough for it to pay, old tool results shrink to stubs and finished `write_file`/`str_replace` arguments are elided.
 
-The turn ends when the model stops calling tools, after `MAX_STEPS`, or on Ctrl+C.
+The turn ends when the model stops calling tools, after `MAX_STEPS`, past `MAX_TURN_TOKENS`, or on Ctrl+C. The turn record says which: `stop_reason` is `done`, `max_steps`, `token_budget` or `cancelled`.
+
+### For scripts and evals
+
+`index.ts --local "<prompt>"` runs one turn and exits. The exit code is `0` when the turn finished (including by hitting a step or token limit - check `stop_reason`) and `3` when it failed: provider down or stalled, an HTTP error, a context overflow. A failed turn still prints `Execution error: ...`, and its `turn` record in the session log carries `error: { name, message }`; a log with no `turn` record at all means the process was killed.
+
+The session log (`SESSION_DIR`, JSONL) holds, besides the messages: a first `meta` record with the settings in effect (sampling, thinking, token caps, context window, provider), one `step` record per main-loop model call written as it returns (usage, thinking tokens, time, finish reason, tool names), and the `turn` record. Subagent and compaction calls are only in the `WIRE_LOG`.
 
 ### One gate for every caller ([`src/execute.ts`](src/execute.ts), [`src/permissions.ts`](src/permissions.ts))
 

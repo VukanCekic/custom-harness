@@ -1,0 +1,1 @@
+{"model":"qwen3-8b","stream":true,"stream_options":{"include_usage":true},"max_tokens":600,"messages":[{"role":"user","content":"What is in the file a.txt? Use the tool."}],"tools":[{"type":"function","function":{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]}

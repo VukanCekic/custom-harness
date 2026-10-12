@@ -42,6 +42,8 @@ export interface AgentOptions {
   onTranscript?: (messages: ChatMessages[], replaced?: string) => void;
   onCacheBreak?: (info: CacheBreak) => void;
   onModeChange?: (mode: Mode) => void;
+  /** Called with each main-loop model call's record the moment it returns, so a log keeps it even if the run is killed later. */
+  onStepRecord?: (record: StepRecord) => void;
   injectReminder?: boolean;
   maxSteps?: number;
   /** "pipeline" restricts the agent to coordinating subagents. */
@@ -52,13 +54,26 @@ export interface AgentOptions {
 
 export interface StepRecord {
   step: number;
+  /** When the request was sent (ISO), and how long it took end to end. */
+  at: string;
+  total_time_ms: number;
+  /** "stop", "tool_calls", or "length" when the reply hit the output limit. */
+  finish_reason: string | null;
   prompt_tokens: number | null;
   completion_tokens: number | null;
+  /** Part of completion_tokens the server counted as thinking, when it says. */
+  reasoning_tokens: number | null;
   cached_tokens: number | null;
   cost: number | null;
   ttft_ms: number | null;
   tool_calls: string[];
 }
+
+/**
+ * Why the loop ended. "done": the model answered without asking for more tools.
+ * "max_steps" and "token_budget": the harness stopped it. "cancelled": the user did.
+ */
+export type StopReason = "done" | "max_steps" | "token_budget" | "cancelled";
 
 export interface CompactionRecord {
   step: number;
@@ -83,6 +98,7 @@ export interface AgentResult {
   /** cached / prompt tokens over this turn's main-loop requests, or null without data. */
   cacheHitRate: number | null;
   cancelled: boolean;
+  stopReason: StopReason;
   mode: Mode;
 }
 
@@ -162,6 +178,7 @@ export async function runAgent(
   let lastMetrics: TimingMetrics | null = null;
   let finalResponse = "";
   let cancelled = false;
+  let stopReason: StopReason = "done";
   const stepUsage: StepRecord[] = [];
   const compactions: CompactionRecord[] = [];
   const cacheBreaks: AgentResult["cacheBreaks"] = [];
@@ -172,6 +189,17 @@ export async function runAgent(
 
       if (step > maxSteps) {
         finalResponse = `(stopped after ${maxSteps} steps without finishing - say "continue" to carry on.)`;
+        stopReason = "max_steps";
+        options.onMessage?.(finalResponse);
+        step--;
+        break;
+      }
+      // The cap on what one turn may generate, subagents and compaction included.
+      // Checked between steps: one request in flight is bounded by MAX_OUTPUT_TOKENS.
+      const generated = ledger.completionTokens - spentBefore.completionTokens;
+      if (config.maxTurnTokens && generated >= config.maxTurnTokens) {
+        finalResponse = `(stopped: this turn has generated ${generated} tokens, over MAX_TURN_TOKENS=${config.maxTurnTokens} - say "continue" to carry on.)`;
+        stopReason = "token_budget";
         options.onMessage?.(finalResponse);
         step--;
         break;
@@ -264,15 +292,21 @@ export async function runAgent(
 
       lastUsage = usage;
       lastMetrics = metrics;
-      stepUsage.push({
+      const stepRecord: StepRecord = {
         step,
+        at: new Date(Date.now() - metrics.total_time_ms).toISOString(),
+        total_time_ms: metrics.total_time_ms,
+        finish_reason: finishReason,
         prompt_tokens: usage?.prompt_tokens ?? null,
         completion_tokens: usage?.completion_tokens ?? null,
+        reasoning_tokens: usage?.reasoning_tokens ?? null,
         cached_tokens: usage?.cached_tokens ?? null,
         cost: usage?.cost ?? null,
         ttft_ms: metrics.time_to_first_token_ms,
         tool_calls: (message.toolCalls ?? []).map((c) => c.function.name)
-      });
+      };
+      stepUsage.push(stepRecord);
+      options.onStepRecord?.(stepRecord);
 
       // Record the assistant's response in history. Reasoning details ride
       // along for providers that need them back during the tool loop; strip
@@ -382,6 +416,7 @@ export async function runAgent(
     // Any abort of the turn's own signal is the user cancelling it.
     if (!(err instanceof CancelledError) && !signal?.aborted) throw err;
     cancelled = true;
+    stopReason = "cancelled";
     finalResponse = "(cancelled by user)";
   } finally {
     // Once the turn is finished, shrink past tool results to stubs - if the
@@ -406,6 +441,7 @@ export async function runAgent(
     costByRole,
     cacheHitRate: main && main.promptTokens > 0 ? main.cachedTokens / main.promptTokens : null,
     cancelled,
+    stopReason,
     mode
   };
 }

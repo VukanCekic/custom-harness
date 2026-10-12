@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import { OpenRouter } from "@openrouter/sdk";
 import type {
   ChatMessages,
@@ -7,11 +8,12 @@ import type {
 } from "@openrouter/sdk/models";
 import { config } from "./config.js";
 import { locked } from "./history.js";
+import { openaiStream, type StreamChunk } from "./openaiCompat.js";
 import { CancelledError, current, type Role } from "./scope.js";
 
-const openrouter = new OpenRouter({
-  apiKey: config.apiKey
-});
+// Built on first use: the local backend has no OpenRouter key and never needs one.
+let client: OpenRouter | undefined;
+const openrouter = (): OpenRouter => (client ??= new OpenRouter({ apiKey: config.apiKey }));
 
 // The SDK default retries 5XX only - for up to an hour, with no request
 // timeout - and never retries 429. Bounded, and rate limits included; the SDK
@@ -168,13 +170,32 @@ export interface CallOptions {
   toolChoice?: "auto" | "required" | "none";
 }
 
-const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS) || undefined;
+const WIRE_LOG = process.env.WIRE_LOG || "";
+
+/**
+ * WIRE_LOG=<file> appends one JSON line per model call - main loop, subagents
+ * and compaction alike, since they all come through callLLM: exactly what was
+ * sent (messages including the late reminder, tool list, sampling) and what
+ * came back (content, thinking, tool calls, finish reason, usage). It is the
+ * source of truth for "what the model saw", which the session log is not.
+ */
+function wireLog(record: Record<string, unknown>): void {
+  if (!WIRE_LOG) return;
+  try {
+    fs.appendFileSync(WIRE_LOG, JSON.stringify(record) + "\n", "utf-8");
+  } catch {
+    // a log that cannot be written must not fail the call it describes
+  }
+}
 
 const EPHEMERAL = { type: "ephemeral" as const };
 
-/** Anthropic caches only up to an explicit breakpoint; other providers cache on their own. */
+/**
+ * Anthropic caches only up to an explicit breakpoint; other providers cache on
+ * their own. Breakpoints are an OpenRouter extension, so never on the local backend.
+ */
 export function usesBreakpoints(model = config.model): boolean {
-  return model.startsWith("anthropic/");
+  return config.backend === "remote" && model.startsWith("anthropic/");
 }
 
 function marked(message: ChatMessages): ChatMessages {
@@ -262,6 +283,9 @@ export async function callLLM(
   if (signal?.aborted) throw abortReason(signal);
 
   const requestStartTime = performance.now();
+  const startedAt = new Date().toISOString();
+  let reasoningText = "";
+  let servedBy: string | undefined;
   let firstTokenTime: number | null = null;
   let lastTokenTime: number | null = null;
   let fullContent = "";
@@ -298,24 +322,63 @@ export async function callLLM(
     ? withBreakpoints(messages, tools, opts.stable)
     : { messages, tools: tools ?? undefined };
 
+  const logCall = (outcome: Record<string, unknown>) =>
+    wireLog({
+      type: "call",
+      role,
+      at: startedAt,
+      duration_ms: Math.round(performance.now() - requestStartTime),
+      backend: config.backend,
+      model: config.model,
+      request: {
+        messages: request.messages,
+        tools: request.tools,
+        tool_choice: opts.toolChoice ?? null,
+        sampling: config.sampling,
+        max_tokens: config.maxOutputTokens ?? null,
+        thinking: config.thinking,
+        provider: config.provider ?? null
+      },
+      ...outcome
+    });
+
   try {
-    const stream = await openrouter.chat.send(
-      {
-        chatRequest: {
+    let stream: AsyncIterable<StreamChunk>;
+    if (config.backend === "local") {
+      stream = await openaiStream(
+        {
+          baseUrl: config.baseUrl,
+          apiKey: config.apiKey,
           model: config.model,
           messages: request.messages,
           tools: request.tools,
-          stream: true,
-          provider: config.provider,
-          ...(opts.toolChoice && request.tools ? { toolChoice: opts.toolChoice } : {}),
-          ...(MAX_OUTPUT_TOKENS ? { maxTokens: MAX_OUTPUT_TOKENS } : {})
-        }
-      },
-      { ...RETRY, signal: abort }
-    );
-
-    if (!(Symbol.asyncIterator in stream)) {
-      throw new Error("Expected a stream response from OpenRouter.");
+          toolChoice: opts.toolChoice,
+          maxTokens: config.maxOutputTokens,
+          sampling: config.sampling,
+          thinking: config.thinking
+        },
+        abort
+      );
+    } else {
+      const response = await openrouter().chat.send(
+        {
+          chatRequest: {
+            model: config.model,
+            messages: request.messages,
+            tools: request.tools,
+            stream: true,
+            provider: config.provider,
+            ...(opts.toolChoice && request.tools ? { toolChoice: opts.toolChoice } : {}),
+            ...(config.maxOutputTokens ? { maxTokens: config.maxOutputTokens } : {}),
+            ...config.sampling
+          }
+        },
+        { ...RETRY, signal: abort }
+      );
+      if (!(Symbol.asyncIterator in response)) {
+        throw new Error("Expected a stream response from OpenRouter.");
+      }
+      stream = response as AsyncIterable<StreamChunk>;
     }
 
     for await (const chunk of stream) {
@@ -327,6 +390,10 @@ export async function callLLM(
         throw new Error(`Provider error mid-stream (${chunk.error.code}): ${chunk.error.message}`);
       }
       finishReason = chunk.choices[0]?.finishReason ?? finishReason;
+      // Which upstream served an OpenRouter request: SDK-typed metadata when present, a raw field otherwise.
+      const meta = (chunk as any).openrouterMetadata;
+      if (Array.isArray(meta?.attempts) && meta.attempts.length > 0) servedBy = meta.attempts[meta.attempts.length - 1]?.provider ?? servedBy;
+      if (typeof (chunk as any).provider === "string") servedBy = (chunk as any).provider;
 
       const delta = chunk.choices[0]?.delta;
       const hasToken = Boolean(
@@ -344,6 +411,8 @@ export async function callLLM(
       if (delta?.reasoningDetails && config.reasoningRoundTrip) {
         mergeReasoning(reasoning, delta.reasoningDetails as any[]);
       }
+
+      if (WIRE_LOG && delta?.reasoning) reasoningText += delta.reasoning;
 
       if (delta?.content) {
         fullContent += delta.content;
@@ -374,16 +443,21 @@ export async function callLLM(
     }
   } catch (err) {
     // The SDK reports every abort alike; say which one it was.
-    if (signal?.aborted) throw abortReason(signal);
-    if (watchdog.signal.aborted) throw abortReason(watchdog.signal);
-    throw err;
+    const thrown = signal?.aborted ? abortReason(signal) : watchdog.signal.aborted ? abortReason(watchdog.signal) : err;
+    logCall({
+      error: { name: (thrown as Error)?.name ?? "Error", message: (thrown as Error)?.message ?? String(thrown) },
+      partial: { content: fullContent, reasoning: reasoningText || undefined }
+    });
+    throw thrown;
   } finally {
     clearTimeout(stall);
     for (const source of sources) source.removeEventListener("abort", onAbort);
   }
 
   if (finishReason === "error") {
-    throw new Error("The provider ended the stream with finish_reason=error.");
+    const failure = new Error("The provider ended the stream with finish_reason=error.");
+    logCall({ error: { name: failure.name, message: failure.message }, partial: { content: fullContent, reasoning: reasoningText || undefined } });
+    throw failure;
   }
 
   const streamEndTime = performance.now();
@@ -437,6 +511,25 @@ export async function callLLM(
 
   const usage = extractUsage(rawUsage, metrics);
   record(role, usage);
+  logCall({
+    response: {
+      content: fullContent,
+      reasoning: reasoningText || undefined,
+      tool_calls: toolCalls,
+      finish_reason: finishReason,
+      served_by: servedBy,
+      usage: usage
+        ? {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cached_tokens: usage.cached_tokens,
+            cost: usage.cost
+          }
+        : null,
+      metrics
+    }
+  });
 
   return {
     message: {

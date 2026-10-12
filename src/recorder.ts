@@ -13,6 +13,8 @@ export interface RunRecord {
   session?: string;
   prompt: string;
   model: string;
+  /** "remote" (OpenRouter) or "local" (OpenAI-compatible server). */
+  backend?: string;
   mode?: string;
   steps: number;
   cancelled?: boolean;

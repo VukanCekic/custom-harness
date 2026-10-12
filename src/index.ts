@@ -14,6 +14,7 @@ import { resetPermissions } from "./permissions.js";
 import { resetPipeline } from "./pipeline.js";
 import { settle, sweep, HANDOFF_OPENING } from "./history.js";
 import { usesBreakpoints, type Spend } from "./llm.js";
+import { checkServer } from "./openaiCompat.js";
 import { blame, forget } from "./cache.js";
 import { CancelledError } from "./scope.js";
 import { Session, legacyTranscript, listSessions, load, resumable, sessionDir } from "./session.js";
@@ -128,7 +129,8 @@ function adopt(messages: ChatMessages[]): ChatMessages[] {
 
 // ------------------------------------------------------------------ one turn
 
-async function runTurn(promptText: string): Promise<void> {
+/** False when the turn ended in an error (provider down, context overflow, ...) rather than finishing or being cancelled. */
+async function runTurn(promptText: string): Promise<boolean> {
   ui.user(promptText);
 
   let spinner = ui.working(`${activeForm()}...`);
@@ -220,6 +222,13 @@ async function runTurn(promptText: string): Promise<void> {
         ui.note(text);
         restart();
       },
+      onStepRecord: (stepRecord) => {
+        try {
+          session.step({ ...stepRecord });
+        } catch {
+          // the log is best-effort; the turn carries on
+        }
+      },
       onStepEnd: (_step, usage) => {
         if (usage) {
           pause();
@@ -249,9 +258,11 @@ async function runTurn(promptText: string): Promise<void> {
     const telemetry = {
       prompt: promptText,
       model: config.model,
+      backend: config.backend,
       mode: result.mode,
       steps: result.steps,
       cancelled: result.cancelled,
+      stop_reason: result.stopReason,
       cost: result.totalCost,
       cost_by_role: result.costByRole,
       cache_hit_rate: result.cacheHitRate,
@@ -275,9 +286,19 @@ async function runTurn(promptText: string): Promise<void> {
     } catch (err: any) {
       ui.note(`Failed to save run details: ${err.message}`);
     }
+    return true;
   } catch (err: any) {
     pause();
-    ui.note(`Execution error: ${err.message || String(err)}`);
+    const message = err.message || String(err);
+    ui.note(`Execution error: ${message}`);
+    // The turn record is also how a log says "this turn failed": one that is
+    // missing means the process was killed, one with `error` means it gave up.
+    try {
+      session.turn({ prompt: promptText, model: config.model, backend: config.backend, error: { name: String(err?.name ?? "Error"), message } });
+    } catch {
+      // the log is best-effort here; the exit code still says it failed
+    }
+    return false;
   } finally {
     turn = null;
   }
@@ -412,8 +433,14 @@ async function command(input: string): Promise<"done" | "exit" | "prompt"> {
 // ------------------------------------------------------------------ main
 
 async function main() {
-  if (!config.apiKey) {
-    ui.note("Error: OPENROUTER_API_KEY is not set in your .env file.");
+  if (config.backend === "local") {
+    const server = await checkServer(config.baseUrl, config.model, config.apiKey);
+    if (!server.ok) {
+      ui.note(`Error: ${server.message}`);
+      process.exit(1);
+    }
+  } else if (!config.apiKey) {
+    ui.note("Error: OPENROUTER_API_KEY is not set in your .env file. (For a local model, use --local.)");
     process.exit(1);
   }
 
@@ -425,7 +452,8 @@ async function main() {
   const cliPrompt = args.filter((a) => !a.startsWith("--")).join(" ").trim();
 
   ui.banner(sandbox.name(), config.model, [
-    `cache: ${usesBreakpoints() ? "anthropic breakpoints" : "provider automatic"}`,
+    config.backend === "local" ? `backend: LOCAL ${config.baseUrl}` : "backend: openrouter",
+    `cache: ${usesBreakpoints() ? "anthropic breakpoints" : config.backend === "local" ? "server prompt cache" : "provider automatic"}`,
     mode === "pipeline" ? "mode: pipeline" : null,
     config.bypassPermissions ? "permissions: BYPASSED" : null
   ].filter((x): x is string => Boolean(x)));
@@ -458,7 +486,9 @@ async function main() {
 
   try {
     if (cliPrompt) {
-      await runTurn(cliPrompt);
+      const ok = await runTurn(cliPrompt);
+      // A script or an eval must be able to tell a failed turn from a finished one.
+      if (!ok) process.exitCode = 3;
       return;
     }
 
@@ -484,7 +514,14 @@ async function main() {
 }
 
 main()
-  .then(() => process.exit(0))
+  .then(() => {
+    // Not process.exit(): on Windows, exiting while a finished fetch's socket is
+    // still closing trips a libuv assertion and the exit code becomes 0xC0000409 -
+    // a good run reported as a crash. Let the loop drain; the unref'd timer only
+    // matters if some handle keeps it alive.
+    process.exitCode ??= 0;
+    setTimeout(() => process.exit(process.exitCode ?? 0), 3_000).unref();
+  })
   .catch(async (err) => {
     await closeBrowser();
     console.error("\nFatal error:", err);
