@@ -28,6 +28,8 @@ export type Script = (body: any, callIndex: number) => MockTurn | Promise<MockTu
 
 export const requests: any[] = [];
 export const rawBodies: string[] = [];
+/** Where each request went and how it authenticated - for the local backend's tests. */
+export const endpoints: Array<{ url: string; authorization: string | null }> = [];
 let script: Script = () => ({ content: "ok" });
 
 export function setScript(s: Script) {
@@ -37,6 +39,7 @@ export function setScript(s: Script) {
 export function reset() {
   requests.length = 0;
   rawBodies.length = 0;
+  endpoints.length = 0;
 }
 
 export function install() {
@@ -46,6 +49,7 @@ export function install() {
     const body = JSON.parse(bodyText);
     requests.push(body);
     rawBodies.push(bodyText);
+    endpoints.push({ url: req.url, authorization: req.headers.get("authorization") });
     const turn = await script(body, requests.length - 1);
     if (turn.delayMs) {
       const signal: AbortSignal | undefined = req.signal;

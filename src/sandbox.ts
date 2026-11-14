@@ -147,7 +147,7 @@ export function wrap(command: string): string[] | null {
  */
 function childEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  for (const key of ["OPENROUTER_API_KEY", ...(process.env.SCRUB_ENV || "").split(",")]) {
+  for (const key of ["OPENROUTER_API_KEY", "LOCAL_API_KEY", ...(process.env.SCRUB_ENV || "").split(",")]) {
     if (key.trim()) delete env[key.trim()];
   }
   return env;
