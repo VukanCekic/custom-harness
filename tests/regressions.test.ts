@@ -1,5 +1,5 @@
 /**
- * Regressions found by the second audit (docs/codebase_audit_and_proposals.md).
+ * Regressions found by the second audit.
  * Each test is named after the finding it pins. The loop tests drive the real
  * agent against the scripted mock in a throwaway git repository.
  */

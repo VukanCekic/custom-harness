@@ -2,7 +2,7 @@
 
 A Node.js + TypeScript coding agent built on `@openrouter/sdk`. It streams answers, runs tools in an autonomous loop, keeps its context window under control without going blind, and can hand big jobs to a planner → worker → reviewer pipeline of isolated subagents. Every request is accounted for: tokens, cache hits, latency and cost, split by who spent it.
 
-The design and its fail-safe guarantees come from the audit in [`docs/codebase_audit_and_proposals.md`](docs/codebase_audit_and_proposals.md). All three of its phases are implemented; see [Audit status](#audit-status).
+The design and its fail-safe guarantees come from a full audit of the codebase, and all of its phases are implemented.
 
 ## Running the agent
 
@@ -229,17 +229,3 @@ The tests live in [`tests/`](tests/) and never call the real API:
 - [`units.test.ts`](tests/units.test.ts): cache breakpoints and telemetry, elision, strip threshold, output sanitising, search tools, `read_file`, todos, browser gating.
 - [`orchestration.test.ts`](tests/orchestration.test.ts): role allowlists, pipeline-mode tools, plan store, review parsing and rendering.
 - [`loop.test.ts`](tests/loop.test.ts): the real loop against a scripted mock LLM ([`tests/helpers/mock.ts`](tests/helpers/mock.ts)) in a throwaway git repo. It covers the full pipeline with rework, the rework bound, cancellation, subagent timeouts, reasoning round-trip, `ask_user`, cache-break attribution, crash-safe session logs and change-note hygiene.
-
-The audit's reproduction harness is in [`docs/audit/verification/`](docs/audit/verification/). Run a scenario against this checkout with:
-
-```bash
-cd docs/audit/verification && npx tsx verify_loop.ts A
-```
-
-## Audit status
-
-| Phase | Items | Status |
-|---|---|---|
-| 1: critical fixes (P0-1 … P0-14) | Fail-safe `fit()`, compaction ordering and cooldown, pinned user requests, shared permission gate for subagents, invalid-JSON handling and step cap, working sandbox, permission bypasses, `str_replace` corruption, Windows shell, provider retries, full cost accounting, provider routing, tracked tests | Done (the audit's patch, plus the §6.7 wiring) |
-| 2: architecture (1–14) | Structured review verdict with bounded rework, plans by reference, untracked-aware review baseline, subagent failure semantics and timeouts, enforced pipeline mode, cache-break telemetry, Anthropic breakpoints, strip threshold, argument elision, crash-safe sessions with `/sessions` and `/rewind`, Ctrl+C cancels the turn, reasoning round-trip, `context.ts` hygiene, browser gating | Done |
-| 3: DX (15–19) | Input history, multiline input, no exit on empty Enter, streamed output, nested subagent panels with cost lines, wrapped and sanitised panels, per-step and per-role telemetry, `ask_user`, `grep`/`glob`, numbered and guarded `read_file`, bare `head`/`tail`, `node:test` suite, CI, lint, dead code removed, clean builds, forced `/compact` | Done. Lint uses oxlint rather than ESLint: `typescript-eslint` does not support TypeScript 7 |
